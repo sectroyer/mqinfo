@@ -141,6 +141,9 @@ Use a non-default listener port or a SOCKS5 proxy when required:
 python3 mqchannels.py 192.0.2.10 channels.txt -p 1415 --socks 127.0.0.1:1080
 ```
 
+Add `-c` or `--color` to color client-connectable channels green, existing
+non-client channels cyan, absent names red, and unconfirmed results yellow.
+
 ## Output
 
 Normal mode prints parsed fields only.

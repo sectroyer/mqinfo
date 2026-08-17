@@ -11,8 +11,15 @@ from pathlib import Path
 import mqlogin
 
 
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.1.1"
 BANNER_TITLE = "IBM MQ Channel Check Tool"
+ANSI_RESET = "\033[0m"
+RESULT_COLORS = {
+    ("exists", "client-connectable"): "\033[32m",
+    ("exists", "non-client"): "\033[36m",
+    ("absent", None): "\033[31m",
+    ("not confirmed", None): "\033[33m",
+}
 
 
 class BannerArgumentParser(argparse.ArgumentParser):
@@ -26,6 +33,7 @@ class ChannelResult:
     name: str
     status: str
     detail: str
+    channel_type: str | None = None
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -48,6 +56,7 @@ def build_parser() -> argparse.ArgumentParser:
         help=f"TCP connect timeout in seconds (default: {mqlogin.CONNECT_TIMEOUT})",
     )
     parser.add_argument("--debug", action="store_true", help="Print initial-flow packet metadata to stderr")
+    parser.add_argument("--color", "-c", action="store_true", help="Color result status by outcome")
     return parser
 
 
@@ -84,7 +93,12 @@ def classify_reply(channel: str, packet: bytes) -> ChannelResult:
         # An INITIAL_INFO response proves the listener recognized the supplied
         # channel. It may still request negotiation changes, which are unrelated
         # to channel-name existence.
-        return ChannelResult(channel, "exists", "listener returned INITIAL_INFO")
+        return ChannelResult(
+            channel,
+            "exists",
+            "listener returned INITIAL_INFO",
+            "client-connectable",
+        )
     if segment_type == mqlogin.RFP_TST_STATUS_INFO:
         swap = packet[8] == 2
         return_code = None
@@ -97,7 +111,8 @@ def classify_reply(channel: str, packet: bytes) -> ChannelResult:
             return ChannelResult(
                 channel,
                 "exists",
-                "not client-connectable (CHANNEL_WRONG_TYPE; exact MQ channel type is not disclosed)",
+                "CHANNEL_WRONG_TYPE; exact MQ channel type is not disclosed",
+                "non-client",
             )
         return ChannelResult(channel, "not confirmed", detail)
     return ChannelResult(channel, "not confirmed", f"unexpected reply segment {segment_type}")
@@ -121,6 +136,16 @@ def check_channel(args: argparse.Namespace, channel: str) -> ChannelResult:
             sock.close()
 
 
+def format_result(result: ChannelResult, color: bool) -> str:
+    type_label = f" [{result.channel_type}]" if result.channel_type else ""
+    status = result.status
+    if color:
+        color_code = RESULT_COLORS.get((result.status, result.channel_type))
+        if color_code:
+            status = f"{color_code}{status}{ANSI_RESET}"
+    return f"{result.name}: {status}{type_label} ({result.detail})"
+
+
 def main() -> int:
     parser = build_parser()
     if len(sys.argv) == 1:
@@ -136,7 +161,7 @@ def main() -> int:
     print(f"[+] Checking {len(channels)} channel name(s) on {args.host}:{args.port}")
     results = [check_channel(args, channel) for channel in channels]
     for result in results:
-        print(f"{result.name}: {result.status} ({result.detail})")
+        print(format_result(result, args.color))
 
     existing = sum(result.status == "exists" for result in results)
     absent = sum(result.status == "absent" for result in results)
