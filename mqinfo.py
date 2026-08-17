@@ -12,8 +12,9 @@ DEFAULT_PORTS = [1414, 1415, 1416, 1417, 1418, 1419]
 CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 2.0
 MAX_READ = 4096
-SCRIPT_VERSION = "0.2.3"
+SCRIPT_VERSION = "0.2.5"
 BANNER_TITLE = "IBM MQ Info Tool"
+TSH_HEADER_SIZE = 28
 IBM_MQ_PROBE = (
     b"TSH\x20\x00\x00\x00\xEC\x01\x01\x31\x00\x00\x00\x00\x00\x00\x00\x00"
     b"\x00\x00\x00\x01\x11\x04\xB8\x00\x00\x49\x44\x20\x20\x0A\x26\x00\x00"
@@ -107,7 +108,7 @@ def wrap_version(raw_version: str) -> List[str]:
 
 
 def extract_mq_metadata(data: bytes) -> Dict[str, str]:
-    if len(data) < 0xD0:
+    if len(data) < TSH_HEADER_SIZE:
         return {}
 
     metadata: Dict[str, str] = {}
@@ -119,15 +120,36 @@ def extract_mq_metadata(data: bytes) -> Dict[str, str]:
     if declared_length:
         metadata["declared_length"] = str(declared_length)
 
-    channel = decode_ebcdic_strip(data[0x34:0x48])
+    id_base = TSH_HEADER_SIZE
+
+    tsh_ccsid = int.from_bytes(data[24:26], byteorder="big", signed=False)
+    if tsh_ccsid:
+        metadata["tsh_ccsid"] = str(tsh_ccsid)
+
+    channel = decode_ebcdic_strip(data[id_base + 24 : id_base + 44])
     if channel:
         metadata["channel"] = channel
 
-    queue_manager = decode_ebcdic_strip(data[0x4C:0x50])
+    queue_manager = decode_ebcdic_strip(data[id_base + 48 : id_base + 96])
     if queue_manager:
         metadata["queue_manager"] = queue_manager
 
-    build_marker = decode_ebcdic_strip(data[0xB0:0xD8])
+    if len(data) >= id_base + 48:
+        ccsid = int.from_bytes(data[id_base + 46 : id_base + 48], byteorder="big", signed=False)
+        if ccsid:
+            metadata["ccsid"] = str(ccsid)
+
+    if len(data) >= id_base + 100:
+        heartbeat_interval = int.from_bytes(
+            data[id_base + 96 : id_base + 100], byteorder="big", signed=False
+        )
+        metadata["heartbeat_interval"] = str(heartbeat_interval)
+
+    product_id = decode_ebcdic_strip(data[id_base + 148 : id_base + 160])
+    if product_id:
+        metadata["product_id"] = product_id
+
+    build_marker = decode_ebcdic_strip(data[id_base + 148 : id_base + 196])
     if build_marker:
         metadata["build_marker"] = build_marker
         match = VERSION_PATTERN.search(build_marker)
@@ -135,6 +157,10 @@ def extract_mq_metadata(data: bytes) -> Dict[str, str]:
             metadata["version"] = parse_mq_version("".join(match.groups()[:4]))
             metadata["build_queue_manager"] = match.group(5)
             metadata["build_id"] = match.group(6)
+
+    queue_manager_id = decode_ebcdic_strip(data[id_base + 160 : id_base + 208])
+    if queue_manager_id:
+        metadata["queue_manager_id"] = queue_manager_id
 
     return metadata
 
@@ -162,16 +188,26 @@ def print_parsed_metadata(metadata: Dict[str, str]) -> None:
         print(f"      - header: {metadata['header']}")
     if "declared_length" in metadata:
         print(f"      - declared_length: {metadata['declared_length']}")
+    if "tsh_ccsid" in metadata:
+        print(f"      - tsh_ccsid: {metadata['tsh_ccsid']}")
     if "channel" in metadata:
         print(f"      - channel: {metadata['channel']}")
     if "queue_manager" in metadata:
         print(f"      - queue_manager: {metadata['queue_manager']}")
+    if "ccsid" in metadata:
+        print(f"      - ccsid: {metadata['ccsid']}")
+    if "heartbeat_interval" in metadata:
+        print(f"      - heartbeat_interval: {metadata['heartbeat_interval']}")
+    if "product_id" in metadata:
+        print(f"      - product_id: {metadata['product_id']}")
     if "build_marker" in metadata:
         print(f"      - build_marker: {metadata['build_marker']}")
     if "version" in metadata:
         print(f"      - version: {metadata['version']}")
     if "build_id" in metadata:
         print(f"      - build_id: {metadata['build_id']}")
+    if "queue_manager_id" in metadata:
+        print(f"      - queue_manager_id: {metadata['queue_manager_id']}")
 
 
 def probe_port(host: str, port: int, debug: bool) -> int:
