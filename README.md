@@ -86,6 +86,13 @@ export MQ_PASSWORD='your-password'
 python3 mqlogin.py 192.0.2.10 --qmgr QM1 --user app
 ```
 
+Check credential pairs sequentially from a UTF-8 file. Each non-empty,
+non-comment line is `username:password`; passwords may contain `:`.
+
+```bash
+python3 mqlogin.py 192.0.2.10 --backend raw --qmgr QM1 --creds credentials.txt
+```
+
 Connect to a non-default port:
 
 ```bash

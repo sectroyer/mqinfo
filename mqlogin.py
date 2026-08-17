@@ -8,9 +8,10 @@ import os
 import socket
 import sys
 from dataclasses import dataclass
+from pathlib import Path
 
 
-SCRIPT_VERSION = "0.2.4"
+SCRIPT_VERSION = "0.2.5"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
@@ -209,8 +210,12 @@ def build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument(
         "--user",
-        required=True,
         help="User name for MQ connection authentication",
+    )
+    parser.add_argument(
+        "--creds",
+        metavar="FILE",
+        help="Check sequential username:password pairs from FILE instead of one --user",
     )
     parser.add_argument(
         "--password",
@@ -255,6 +260,10 @@ def parse_args() -> argparse.Namespace:
         parser.error("port must be between 1 and 65535")
     if args.timeout <= 0:
         parser.error("timeout must be greater than 0")
+    if bool(args.user) == bool(args.creds):
+        parser.error("provide exactly one of --user or --creds")
+    if args.creds and args.password is not None:
+        parser.error("--password cannot be used with --creds")
     return args
 
 
@@ -279,6 +288,28 @@ def resolve_password(args: argparse.Namespace) -> str:
             return value
 
     return getpass.getpass("MQ password: ")
+
+
+def read_credentials_file(filename: str) -> list[tuple[str, str]]:
+    try:
+        lines = Path(filename).read_text(encoding="utf-8").splitlines()
+    except OSError as exc:
+        raise ValueError(f"cannot read credentials file {filename!r}: {exc}") from exc
+
+    credentials: list[tuple[str, str]] = []
+    for line_number, line in enumerate(lines, start=1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        if ":" not in line:
+            raise ValueError(f"credentials file line {line_number}: expected username:password")
+        username, password = line.split(":", 1)
+        username = username.strip()
+        if not username:
+            raise ValueError(f"credentials file line {line_number}: username is empty")
+        credentials.append((username, password))
+    if not credentials:
+        raise ValueError("credentials file contains no credential pairs")
+    return credentials
 
 
 def parse_socks_proxy(proxy: str) -> tuple[str, int]:
@@ -1012,14 +1043,16 @@ def choose_backend(args: argparse.Namespace) -> str:
         return "raw"
 
 
-def connect_and_report(args: argparse.Namespace) -> int:
-    password = resolve_password(args)
+def connect_and_report(args: argparse.Namespace, password: str | None = None, show_banner: bool = True) -> int:
+    if password is None:
+        password = resolve_password(args)
     backend = choose_backend(args)
     conn_name = f"{args.host}({args.port})"
 
-    print()
-    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}")
-    print()
+    if show_banner:
+        print()
+        print(f"{BANNER_TITLE} v{SCRIPT_VERSION}")
+        print()
     print(f"[+] Connecting to {conn_name}")
     print(f"    channel: {args.channel}")
     print(f"    queue manager: {args.qmgr or '<default>'}")
@@ -1059,8 +1092,29 @@ def connect_and_report(args: argparse.Namespace) -> int:
     return 1
 
 
+def check_credentials_file(args: argparse.Namespace) -> int:
+    credentials = read_credentials_file(args.creds)
+    print()
+    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}")
+    print()
+    print(f"[+] Checking {len(credentials)} credential pair(s) sequentially")
+
+    successes = 0
+    for index, (username, password) in enumerate(credentials, start=1):
+        print(f"\n[{index}/{len(credentials)}]")
+        args.user = username
+        if connect_and_report(args, password, show_banner=False) == 0:
+            successes += 1
+
+    failures = len(credentials) - successes
+    print(f"[+] Summary: {successes} authorized, {failures} not authorized or not confirmed")
+    return 0 if failures == 0 else 1
+
+
 def main() -> int:
     args = parse_args()
+    if args.creds:
+        return check_credentials_file(args)
     return connect_and_report(args)
 
 
