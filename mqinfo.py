@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import ipaddress
 import re
 import socket
 import string
@@ -12,7 +13,7 @@ DEFAULT_PORTS = [1414, 1415, 1416, 1417, 1418, 1419]
 CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 2.0
 MAX_READ = 4096
-SCRIPT_VERSION = "0.2.5"
+SCRIPT_VERSION = "0.2.6"
 BANNER_TITLE = "IBM MQ Info Tool"
 TSH_HEADER_SIZE = 28
 IBM_MQ_PROBE = (
@@ -55,6 +56,10 @@ def build_parser() -> argparse.ArgumentParser:
         "--debug",
         action="store_true",
         help="Print raw response details in addition to parsed MQ metadata",
+    )
+    parser.add_argument(
+        "--socks",
+        help="Connect through a SOCKS5 proxy specified as host:port or socks5://host:port",
     )
     return parser
 
@@ -105,6 +110,106 @@ def parse_mq_version(raw_version: str) -> str:
 
 def wrap_version(raw_version: str) -> List[str]:
     return [raw_version[i : i + 2] for i in range(0, len(raw_version), 2)]
+
+
+def parse_socks_proxy(proxy: str) -> tuple[str, int]:
+    value = proxy.strip()
+    if "://" in value:
+        scheme, value = value.split("://", 1)
+        if scheme.lower() != "socks5":
+            raise ValueError(f"unsupported proxy scheme: {scheme}")
+
+    if ":" not in value:
+        raise ValueError("proxy must be in host:port format")
+
+    host, port_text = value.rsplit(":", 1)
+    host = host.strip()
+    if not host:
+        raise ValueError("proxy host cannot be empty")
+
+    try:
+        port = int(port_text)
+    except ValueError as exc:
+        raise ValueError(f"invalid proxy port: {port_text}") from exc
+
+    if not 1 <= port <= 65535:
+        raise ValueError(f"invalid proxy port: {port}")
+
+    return host, port
+
+
+def recv_exact(sock: socket.socket, size: int) -> bytes:
+    chunks = []
+    remaining = size
+    while remaining > 0:
+        chunk = sock.recv(remaining)
+        if not chunk:
+            raise OSError("connection closed while reading from SOCKS proxy")
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    return b"".join(chunks)
+
+
+def build_socks5_address(target_host: str, target_port: int) -> bytes:
+    try:
+        host_ip = ipaddress.ip_address(target_host)
+    except ValueError:
+        encoded_host = target_host.encode("idna")
+        if len(encoded_host) > 255:
+            raise ValueError("target hostname is too long for SOCKS5")
+        return b"\x03" + bytes([len(encoded_host)]) + encoded_host + target_port.to_bytes(2, "big")
+
+    if host_ip.version == 4:
+        return b"\x01" + host_ip.packed + target_port.to_bytes(2, "big")
+    return b"\x04" + host_ip.packed + target_port.to_bytes(2, "big")
+
+
+def skip_socks5_bound_address(sock: socket.socket, atyp: int) -> None:
+    if atyp == 0x01:
+        recv_exact(sock, 4 + 2)
+        return
+    if atyp == 0x04:
+        recv_exact(sock, 16 + 2)
+        return
+    if atyp == 0x03:
+        host_length = recv_exact(sock, 1)[0]
+        recv_exact(sock, host_length + 2)
+        return
+    raise OSError(f"unsupported SOCKS5 address type in reply: {atyp}")
+
+
+def socks5_connect(sock: socket.socket, target_host: str, target_port: int) -> None:
+    sock.sendall(b"\x05\x01\x00")
+    method_reply = recv_exact(sock, 2)
+    if method_reply[0] != 0x05:
+        raise OSError("invalid SOCKS5 proxy response version")
+    if method_reply[1] != 0x00:
+        raise OSError("SOCKS5 proxy requires unsupported authentication")
+
+    request = b"\x05\x01\x00" + build_socks5_address(target_host, target_port)
+    sock.sendall(request)
+
+    reply = recv_exact(sock, 4)
+    if reply[0] != 0x05:
+        raise OSError("invalid SOCKS5 proxy reply version")
+    if reply[1] != 0x00:
+        raise OSError(f"SOCKS5 proxy connect failed with status 0x{reply[1]:02x}")
+
+    skip_socks5_bound_address(sock, reply[3])
+
+
+def open_socket(target_host: str, target_port: int, socks_proxy: str | None) -> socket.socket:
+    if not socks_proxy:
+        return socket.create_connection((target_host, target_port), timeout=CONNECT_TIMEOUT)
+
+    proxy_host, proxy_port = parse_socks_proxy(socks_proxy)
+    sock = socket.create_connection((proxy_host, proxy_port), timeout=CONNECT_TIMEOUT)
+    try:
+        socks5_connect(sock, target_host, target_port)
+        return sock
+    except Exception:
+        sock.close()
+        raise
 
 
 def extract_mq_metadata(data: bytes) -> Dict[str, str]:
@@ -210,10 +315,10 @@ def print_parsed_metadata(metadata: Dict[str, str]) -> None:
         print(f"      - queue_manager_id: {metadata['queue_manager_id']}")
 
 
-def probe_port(host: str, port: int, debug: bool) -> int:
+def probe_port(host: str, port: int, debug: bool, socks_proxy: str | None) -> int:
     print(f"[+] Probing {host}:{port}")
     try:
-        with socket.create_connection((host, port), timeout=CONNECT_TIMEOUT) as sock:
+        with open_socket(host, port, socks_proxy) as sock:
             sock.settimeout(READ_TIMEOUT)
             passive_data = recv_all(sock)
             if passive_data:
@@ -290,7 +395,11 @@ def main() -> int:
         if not 1 <= port <= 65535:
             print(f"invalid port: {port}", file=sys.stderr)
             return 2
-        rc |= probe_port(args.host, port, args.debug)
+        try:
+            rc |= probe_port(args.host, port, args.debug, args.socks)
+        except ValueError as exc:
+            print(f"invalid SOCKS proxy: {exc}", file=sys.stderr)
+            return 2
 
     print()
     return rc

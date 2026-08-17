@@ -8,6 +8,7 @@ It connects to the target, checks the standard IBM MQ listener ports by default,
 
 - Checks the default IBM MQ TCP ports `1414` through `1419`
 - Accepts `-p` / `--port` to probe a single port
+- Accepts `--socks` to connect through a SOCKS5 proxy
 - Accepts `-d` / `--debug` to print raw response data and extracted strings
 - Parses common IBM MQ response fields such as channel, queue manager, version, and build marker
 - Shows built-in help with the tool banner when run without arguments
@@ -40,6 +41,13 @@ Probe a single port:
 python3 mqinfo.py 192.0.2.10 -p 1414
 ```
 
+Probe through a SOCKS5 proxy:
+
+```bash
+python3 mqinfo.py 192.0.2.10 --socks 127.0.0.1:1080
+python3 mqinfo.py 192.0.2.10 -p 1414 --socks socks5://127.0.0.1:1080
+```
+
 Enable verbose debug output:
 
 ```bash
@@ -57,9 +65,13 @@ Typical parsed fields:
 - `declared_length`: Response length declared in the MQ packet
 - `channel`: Listener channel name returned by the target
 - `queue_manager`: Queue manager identifier parsed from the response
+- `ccsid`: MQ character set identifier from the reply
+- `heartbeat_interval`: Negotiated MQ heartbeat interval
+- `product_id`: MQ product/version identifier prefix
 - `build_marker`: Raw IBM MQ build/version marker, shown as an anonymized placeholder in examples
 - `version`: Parsed MQ version
 - `build_id`: Build token extracted from the build marker
+- `queue_manager_id`: MQ queue manager identifier from the reply
 
 Example:
 
