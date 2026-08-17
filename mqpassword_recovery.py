@@ -8,6 +8,8 @@ from collections import defaultdict
 
 SCRIPT_VERSION = "0.1.0"
 BANNER_TITLE = "IBM MQ Password Recovery Tool"
+BANNER_CREDIT = "by Michał Majchrowicz AFINE Team"
+BANNER_LINE = f"{BANNER_TITLE} v{SCRIPT_VERSION} {BANNER_CREDIT}"
 DEFAULT_PORT = 1414
 TSH_HEADER_SIZE = 28
 
@@ -468,7 +470,7 @@ def main() -> int:
 
     args = parser.parse_args()
 
-    print(f"\n{BANNER_TITLE} v{SCRIPT_VERSION}\n")
+    print(f"\n{BANNER_LINE}\n")
 
     streams = reassemble_streams(args.pcap, args.port, args.debug)
     if not streams:

@@ -14,6 +14,8 @@ from pathlib import Path
 
 SCRIPT_VERSION = "0.2.11"
 BANNER_TITLE = "IBM MQ Login Tool"
+BANNER_CREDIT = "by Michał Majchrowicz AFINE Team"
+BANNER_LINE = f"{BANNER_TITLE} v{SCRIPT_VERSION} {BANNER_CREDIT}"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
 CONNECT_TIMEOUT = 3.0
@@ -108,7 +110,7 @@ MQRC_NAMES = {
 
 class BannerArgumentParser(argparse.ArgumentParser):
     def format_help(self) -> str:
-        banner = f"\n{BANNER_TITLE} v{SCRIPT_VERSION}\n\n"
+        banner = f"\n{BANNER_LINE}\n\n"
         return banner + super().format_help() + "\n"
 
 
@@ -1088,7 +1090,7 @@ def choose_backend(args: argparse.Namespace) -> str:
 
 
 def list_backends() -> int:
-    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}\n")
+    print(f"{BANNER_LINE}\n")
     print("raw: available (built in; plaintext TCP only, no TLS support)")
     try:
         import ibmmq  # type: ignore  # noqa: F401
@@ -1143,7 +1145,7 @@ def probe_remote_transport(args: argparse.Namespace, tls: bool) -> str:
 
 
 def list_remote_backends(args: argparse.Namespace) -> int:
-    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}\n")
+    print(f"{BANNER_LINE}\n")
     print(f"[+] Probing connection types on {args.host}:{args.port}")
     print(f"    channel: {args.channel}")
     print(f"    plaintext RFP: {probe_remote_transport(args, tls=False)}")
@@ -1160,7 +1162,7 @@ def connect_and_report(args: argparse.Namespace, password: str | None = None, sh
 
     if show_banner:
         print()
-        print(f"{BANNER_TITLE} v{SCRIPT_VERSION}")
+        print(BANNER_LINE)
         print()
     print(f"[+] Connecting to {conn_name}")
     print(f"    channel: {args.channel}")
@@ -1219,7 +1221,7 @@ def credential_result_line(username: str, result: RawLoginResult) -> str:
 def check_credentials_file(args: argparse.Namespace) -> int:
     credentials = read_credentials_file(args.creds)
     print()
-    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}")
+    print(BANNER_LINE)
     print()
     print(f"[+] Checking {len(credentials)} credential pair(s) sequentially")
 

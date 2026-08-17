@@ -15,6 +15,8 @@ READ_TIMEOUT = 2.0
 MAX_READ = 4096
 SCRIPT_VERSION = "0.2.10"
 BANNER_TITLE = "IBM MQ Info Tool"
+BANNER_CREDIT = "by Michał Majchrowicz AFINE Team"
+BANNER_LINE = f"{BANNER_TITLE} v{SCRIPT_VERSION} {BANNER_CREDIT}"
 TSH_HEADER_SIZE = 28
 IBM_MQ_PROBE = (
     b"TSH\x20\x00\x00\x00\xEC\x01\x01\x31\x00\x00\x00\x00\x00\x00\x00\x00"
@@ -126,7 +128,7 @@ RFP_ERR_CODES = {
 
 class BannerArgumentParser(argparse.ArgumentParser):
     def format_help(self) -> str:
-        banner = f"\n{BANNER_TITLE} v{SCRIPT_VERSION}\n\n"
+        banner = f"\n{BANNER_LINE}\n\n"
         return banner + super().format_help() + "\n"
 
 
@@ -647,7 +649,7 @@ def main() -> int:
     ports = [args.port] if args.port else DEFAULT_PORTS
 
     print()
-    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}")
+    print(BANNER_LINE)
     print()
 
     rc = 0
