@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass
 
 
-SCRIPT_VERSION = "0.2.2"
+SCRIPT_VERSION = "0.2.3"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
@@ -525,7 +525,14 @@ def build_tsh(segment_type: int, payload_length: int, control_flags1: int, ccsid
     return bytes(tsh)
 
 
-def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes, ccsid: int = LOCAL_CCSID) -> bytes:
+def build_initial_id_packet(
+    channel: str,
+    qmgr: str,
+    client_r: bytes,
+    ccsid: int = LOCAL_CCSID,
+    id_flags2: int = 0x51,
+    id_flags3: int = 0x28,
+) -> bytes:
     payload = bytearray(240)
     # RfpID uses a literal ASCII eyecatcher, unlike the MQ character fields.
     payload[0:4] = b"ID  "
@@ -538,7 +545,7 @@ def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes, ccsid: int
     write_u32(payload, 16, 0)
     write_u32(payload, 20, 0)
     payload[24:44] = encode_mq_field(channel, 20, ccsid)
-    payload[44] = 0x51
+    payload[44] = id_flags2
     payload[45] = 0
     payload[46:48] = ccsid.to_bytes(2, "big")
     payload[48:96] = encode_mq_field(qmgr, 48, ccsid)
@@ -547,8 +554,10 @@ def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes, ccsid: int
     payload[102] = 0
     payload[104:106] = b"\x00\xFF"
     payload[106:122] = b"\xFF" * 16
-    write_u32(payload, 128, 1)
-    payload[132] = 0x28
+    # This raw backend implements normal TSH flows only. Do not negotiate MSH
+    # multiplexing, whose header uses different offsets.
+    write_u32(payload, 128, 0)
+    payload[132] = id_flags3
     payload[133] = 0
     payload[148:160] = encode_mq_field("MQJB00000000", 12, ccsid)
     payload[160:208] = encode_mq_field("PYMQLOGIN", 48, ccsid)
@@ -563,28 +572,28 @@ def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes, ccsid: int
     return tsh + payload
 
 
-def build_mqcd(connection_name: str, channel: str) -> bytes:
+def build_mqcd(connection_name: str, channel: str, ccsid: int) -> bytes:
     size = 332
     payload = bytearray(size)
-    payload[0:20] = encode_mq_field(channel, 20)
+    payload[0:20] = encode_mq_field(channel, 20, ccsid)
     write_u32(payload, 20, MQCD_VERSION_1)
     write_u32(payload, 24, MQ_CHLTYPE_CLNTCONN)
     write_u32(payload, 28, MQ_TRPTYPE_TCP)
-    payload[144:164] = encode_ascii_field(connection_name, 20)
+    payload[144:164] = encode_mq_field(connection_name, 20, ccsid)
     return bytes(payload)
 
 
-def build_mqcsp(user: str, password: str) -> bytes:
+def build_mqcsp(user: str, password: str, ccsid: int) -> bytes:
     ptr_size = 4
     base_size = 48
-    total_size = base_size + align_to_grain(ptr_size, base_size) + len(user.encode()) + len(password.encode())
+    user_bytes = encode_mq_bytes(user, ccsid)
+    password_bytes = encode_mq_bytes(password, ccsid)
+    total_size = base_size + align_to_grain(ptr_size, base_size) + len(user_bytes) + len(password_bytes)
     payload = bytearray(total_size)
     payload[0:4] = b"CSP "
     write_u32(payload, 4, MQCSP_VERSION_1)
     write_u32(payload, 8, MQCSP_AUTH_USER_ID_AND_PWD)
     pos = base_size + align_to_grain(ptr_size, base_size)
-    user_bytes = user.encode("ascii", errors="ignore")
-    password_bytes = password.encode("ascii", errors="ignore")
     write_u32(payload, 20, pos)
     write_u32(payload, 24, len(user_bytes))
     payload[pos : pos + len(user_bytes)] = user_bytes
@@ -617,10 +626,10 @@ def build_fap_mqcno() -> bytes:
     return bytes(payload)
 
 
-def build_rfp_mqconn(qmgr: str, app_name: str) -> bytes:
+def build_rfp_mqconn(qmgr: str, app_name: str, ccsid: int) -> bytes:
     payload = bytearray(120)
-    payload[0:48] = encode_mq_field(qmgr, 48)
-    payload[48:76] = encode_mq_field(app_name, 28)
+    payload[0:48] = encode_mq_field(qmgr, 48, ccsid)
+    payload[48:76] = encode_mq_field(app_name, 28, ccsid)
     write_u32(payload, 76, 0)
     write_u32(payload, 112, RFP_OPT_MQCONNX)
     write_u32(payload, 116, 0)
@@ -633,17 +642,17 @@ def build_mqapi_header(call_length: int) -> bytes:
     return bytes(payload)
 
 
-def build_mqconn_packet(host: str, port: int, qmgr: str, channel: str, user: str, password: str) -> bytes:
+def build_mqconn_packet(host: str, port: int, qmgr: str, channel: str, user: str, password: str, ccsid: int) -> bytes:
     connection_name = f"{host}({port})"
     app_name = "PYMQLOGIN"
-    mqcd = build_mqcd(connection_name, channel)
-    mqcsp = build_mqcsp(user, password)
+    mqcd = build_mqcd(connection_name, channel, ccsid)
+    mqcsp = build_mqcsp(user, password, ccsid)
     mqcno = build_mqcno(mqcd, mqcsp)
     fap_mqcno = build_fap_mqcno()
-    rfp_mqconn = build_rfp_mqconn(qmgr, app_name)
+    rfp_mqconn = build_rfp_mqconn(qmgr, app_name, ccsid)
     call_body = rfp_mqconn + fap_mqcno + mqcno
     mqapi = build_mqapi_header(len(call_body))
-    tsh = build_tsh(RFP_TST_MQCONN, len(mqapi) + len(call_body), RFP_TCF_FIRST | RFP_TCF_LAST)
+    tsh = build_tsh(RFP_TST_MQCONN, len(mqapi) + len(call_body), RFP_TCF_FIRST | RFP_TCF_LAST, ccsid)
     return tsh + mqapi + call_body
 
 
@@ -711,6 +720,20 @@ def debug_tsh(args: argparse.Namespace, direction: str, stage: str, packet: byte
     )
 
 
+def debug_id_reply(args: argparse.Namespace, packet: bytes) -> None:
+    if not args.debug or len(packet) < TSH_HEADER_SIZE + 134:
+        return
+    body = packet[TSH_HEADER_SIZE:]
+    print(
+        f"[debug] ID fields: id_flags=0x{body[5]:02x} ide_flags=0x{body[6]:02x} "
+        f"err_flags=0x{body[7]:02x} id_flags2=0x{body[44]:02x} "
+        f"ide_flags2=0x{body[45]:02x} err_flags2=0x{body[102]:02x} "
+        f"id_flags3=0x{body[132]:02x} ide_flags3=0x{body[133]:02x} "
+        f"max_xmit={read_u32(body, 12)}",
+        file=sys.stderr,
+    )
+
+
 def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None, int | None, int | None, bytes, bool, int]:
     if len(packet) < TSH_HEADER_SIZE + 8:
         return None, None, None, None, None, b"", False, LOCAL_CCSID
@@ -732,9 +755,13 @@ def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None
 
 
 def parse_mqconn_reply(packet: bytes) -> RawLoginResult:
-    if len(packet) < TSH_HEADER_SIZE + MQAPI_HEADER_SIZE:
+    if len(packet) < TSH_HEADER_SIZE:
         return RawLoginResult(ok=False, error_text="short MQCONN reply")
     segment_type = packet[9]
+    if segment_type == RFP_TST_STATUS_INFO:
+        return RawLoginResult(ok=False, error_text=f"MQCONN status error: {describe_error_status(packet)}")
+    if len(packet) < TSH_HEADER_SIZE + MQAPI_HEADER_SIZE:
+        return RawLoginResult(ok=False, error_text="short MQCONN reply")
     if segment_type != RFP_TST_MQCONN_REPLY:
         return RawLoginResult(
             ok=False,
@@ -782,10 +809,14 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
     try:
         sock.settimeout(READ_TIMEOUT)
         active_ccsid = LOCAL_CCSID
-        for id_attempt in range(2):
+        id_flags2 = 0x51
+        id_flags3 = 0x28
+        for id_attempt in range(4):
             stage = "id-send"
             client_r = os.urandom(12)
-            id_packet = build_initial_id_packet(args.channel, args.qmgr, client_r, active_ccsid)
+            id_packet = build_initial_id_packet(
+                args.channel, args.qmgr, client_r, active_ccsid, id_flags2, id_flags3
+            )
             debug_tsh(args, "tx", stage, id_packet)
             sock.sendall(id_packet)
             stage = "id-recv"
@@ -801,6 +832,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                     error_text=f"expected INITIAL_INFO reply, received segment {id_reply[9]}{status_detail}",
                 )
             err_flag, channel, queue_manager, fap_level, ppa, server_r, swap, remote_ccsid = parse_id_response(id_reply)
+            debug_id_reply(args, id_reply)
             if args.debug:
                 print(
                     f"[debug] negotiated: fap={fap_level} ppa={ppa} byte_order="
@@ -809,8 +841,14 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                     file=sys.stderr,
                 )
             if id_reply[10] & 0x02:
-                if id_attempt == 0 and remote_ccsid != active_ccsid:
-                    active_ccsid = remote_ccsid
+                body = id_reply[TSH_HEADER_SIZE:]
+                next_ccsid = remote_ccsid
+                next_flags2 = id_flags2 & ~body[45]
+                next_flags3 = id_flags3 & ~body[133]
+                if (next_ccsid, next_flags2, next_flags3) != (active_ccsid, id_flags2, id_flags3):
+                    active_ccsid = next_ccsid
+                    id_flags2 = next_flags2
+                    id_flags3 = next_flags3
                     continue
                 return RawLoginResult(
                     ok=False,
@@ -818,7 +856,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                     channel=channel,
                     fap_level=fap_level,
                     stage=stage,
-                    error_text="queue manager rejected initial negotiation after CCSID retry",
+                    error_text="queue manager rejected initial negotiation without a supported retry change",
                 )
             break
         else:
@@ -886,7 +924,9 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
             )
 
         stage = "mqconn-send"
-        mqconn_packet = build_mqconn_packet(args.host, args.port, args.qmgr, args.channel, args.user, password)
+        mqconn_packet = build_mqconn_packet(
+            args.host, args.port, args.qmgr, args.channel, args.user, password, active_ccsid
+        )
         debug_tsh(args, "tx", stage, mqconn_packet)
         sock.sendall(mqconn_packet)
         stage = "mqconn-recv"
