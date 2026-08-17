@@ -5,6 +5,7 @@
 It connects to the target, checks the standard IBM MQ listener ports by default, sends an IBM MQ-style probe when no passive banner is returned, and parses the response into readable metadata.
 
 The repository also includes `mqlogin.py`, a separate single-credential connection tester for legitimate IBM MQ client authentication checks.
+`mqchannels.py` checks explicitly supplied channel names without sending credentials.
 
 ## Features
 
@@ -118,6 +119,26 @@ Connect through a SOCKS5 proxy:
 
 ```bash
 python3 mqlogin.py 192.0.2.10 --backend raw --socks 127.0.0.1:1080 --qmgr QM1 --user app
+```
+
+### Channel Name Check
+
+Check channel names from a UTF-8 file. Each non-empty, non-comment line is
+one channel name. The script sends only the unauthenticated initial MQ ID flow;
+it does not send a user name, password, or MQCONN request.
+
+`NO_CHANNEL` is reported as absent. `CHANNEL_WRONG_TYPE` is reported as an
+existing channel that is not client-connectable; this flow cannot disclose its
+exact MQ channel type.
+
+```bash
+python3 mqchannels.py 192.0.2.10 channels.txt --qmgr QM1
+```
+
+Use a non-default listener port or a SOCKS5 proxy when required:
+
+```bash
+python3 mqchannels.py 192.0.2.10 channels.txt -p 1415 --socks 127.0.0.1:1080
 ```
 
 ## Output

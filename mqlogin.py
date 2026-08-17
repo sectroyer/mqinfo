@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SCRIPT_VERSION = "0.2.6"
+SCRIPT_VERSION = "0.2.7"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
@@ -130,12 +130,14 @@ def authorization_summary(result: RawLoginResult) -> str:
     if result.reason_code == 2035:
         return (
             "failed (MQRC_NOT_AUTHORIZED): the effective MQ identity is not permitted "
-            "to connect to this queue manager"
+            "to connect to this queue manager; MQ does not disclose whether the "
+            "username exists, the password is wrong, or CHLAUTH changed the identity"
         )
     if result.stage == "caut-recv":
         return (
             "failed during CONNAUTH: the queue manager rejected the supplied "
-            f"authentication data ({result.error_text or 'unknown status error'})"
+            "authentication data without disclosing whether the username exists "
+            f"({result.error_text or 'unknown status error'})"
         )
     if result.reason_code is not None:
         return f"not confirmed ({format_mqrc(result.reason_code)}): {result.error_text or 'MQCONN failed'}"
