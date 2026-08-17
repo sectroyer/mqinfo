@@ -9,7 +9,7 @@ import sys
 from dataclasses import dataclass
 
 
-SCRIPT_VERSION = "0.2.0"
+SCRIPT_VERSION = "0.2.1"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
@@ -365,17 +365,17 @@ def write_u32(buffer: bytearray, offset: int, value: int) -> None:
     buffer[offset : offset + 4] = value.to_bytes(4, "big", signed=False)
 
 
-def write_u32_native(buffer: bytearray, offset: int, value: int) -> None:
-    """Write RFP structure integers as IBM's Java client does on x86 hosts."""
-    buffer[offset : offset + 4] = value.to_bytes(4, "little", signed=False)
+def write_u32_ordered(buffer: bytearray, offset: int, value: int, swap: bool) -> None:
+    """Write RFP structure integers in the queue manager's negotiated order."""
+    buffer[offset : offset + 4] = value.to_bytes(4, "little" if swap else "big", signed=False)
 
 
 def read_u32(buffer: bytes | bytearray, offset: int) -> int:
     return int.from_bytes(buffer[offset : offset + 4], "big", signed=False)
 
 
-def read_u32_native(buffer: bytes | bytearray, offset: int) -> int:
-    return int.from_bytes(buffer[offset : offset + 4], "little", signed=False)
+def read_u32_ordered(buffer: bytes | bytearray, offset: int, swap: bool) -> int:
+    return int.from_bytes(buffer[offset : offset + 4], "little" if swap else "big", signed=False)
 
 
 def _bytes_to_bits(byte_data: bytes) -> list[int]:
@@ -450,8 +450,10 @@ def _des_encrypt_block(key: bytes, block: bytes) -> bytes:
     return _bits_to_bytes(output_bits)
 
 
-def remote_ppa_finish_auth_flow(buffer: bytearray, length_offset: int, password_offset: int, r_state: bytes, ppa: int) -> int:
-    password_length = read_u32_native(buffer, length_offset)
+def remote_ppa_finish_auth_flow(
+    buffer: bytearray, length_offset: int, password_offset: int, r_state: bytes, ppa: int, swap: bool
+) -> int:
+    password_length = read_u32_ordered(buffer, length_offset, swap)
     if ppa == 0:
         return password_length
     if password_length == 0:
@@ -631,30 +633,29 @@ def build_uid_packet(user: str, fap_level: int) -> bytes:
     return tsh + payload
 
 
-def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_state: bytes) -> bytes:
+def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_state: bytes, swap: bool) -> bytes:
     user_bytes = user.encode("ascii", errors="ignore")
     password_bytes = password.encode("ascii", errors="ignore")
     user_id_offset = 32 if fap_level > 16 else 24
     payload = bytearray(user_id_offset + len(user_bytes) + len(password_bytes))
     payload[0:4] = b"CAUT"
-    # RfpCAUT uses JmqiDC.writeI32(..., this.swap). On the supported Java
-    # client platforms that is little-endian; network-order values make the
-    # queue manager interpret these lengths as invalidly large.
-    write_u32_native(payload, 4, MQCSP_AUTH_USER_ID_AND_PWD)
-    write_u32_native(payload, 8, len(user_bytes))
-    write_u32_native(payload, 12, len(password_bytes))
-    write_u32_native(payload, 16, len(user_bytes))
-    write_u32_native(payload, 20, len(password_bytes))
+    # RfpCAUT uses JmqiDC.writeI32(..., this.swap); swap is negotiated from
+    # the received TSH encoding (1 = big-endian, 2 = little-endian).
+    write_u32_ordered(payload, 4, MQCSP_AUTH_USER_ID_AND_PWD, swap)
+    write_u32_ordered(payload, 8, len(user_bytes), swap)
+    write_u32_ordered(payload, 12, len(password_bytes), swap)
+    write_u32_ordered(payload, 16, len(user_bytes), swap)
+    write_u32_ordered(payload, 20, len(password_bytes), swap)
     if fap_level > 16:
-        write_u32_native(payload, 24, 0)
-        write_u32_native(payload, 28, 0)
+        write_u32_ordered(payload, 24, 0, swap)
+        write_u32_ordered(payload, 28, 0, swap)
     payload[user_id_offset : user_id_offset + len(user_bytes)] = user_bytes
     password_offset = user_id_offset + len(user_bytes)
     payload[password_offset : password_offset + len(password_bytes)] = password_bytes
-    new_password_len = remote_ppa_finish_auth_flow(payload, 20, password_offset, r_state, ppa)
+    new_password_len = remote_ppa_finish_auth_flow(payload, 20, password_offset, r_state, ppa, swap)
     if new_password_len < 0:
         raise ValueError(f"unsupported MQ password protection algorithm: {ppa}")
-    write_u32_native(payload, 20, new_password_len)
+    write_u32_ordered(payload, 20, new_password_len, swap)
     tsh = build_tsh(RFP_TST_CONAUTH_INFO, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST)
     return tsh + payload
 
@@ -668,9 +669,9 @@ def recv_tsh_packet(sock: socket.socket) -> bytes:
     return header + body
 
 
-def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None, int | None, int | None, bytes]:
+def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None, int | None, int | None, bytes, bool]:
     if len(packet) < TSH_HEADER_SIZE + 104:
-        return None, None, None, None, None, b""
+        return None, None, None, None, None, b"", False
     base = TSH_HEADER_SIZE
     fap_level = packet[base + 4]
     err = packet[base + 7]
@@ -680,7 +681,7 @@ def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None
     if len(packet) >= base + 210:
         ppa = int.from_bytes(packet[base + 208 : base + 210], "big", signed=False)
     server_r = packet[base + 228 : base + 240] if len(packet) >= base + 240 else b""
-    return err, channel, queue_manager, fap_level, ppa, server_r
+    return err, channel, queue_manager, fap_level, ppa, server_r, packet[8] == 2
 
 
 def parse_mqconn_reply(packet: bytes) -> RawLoginResult:
@@ -724,7 +725,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
         client_r = os.urandom(12)
         sock.sendall(build_initial_id_packet(args.channel, args.qmgr, client_r))
         id_reply = recv_tsh_packet(sock)
-        err_flag, channel, queue_manager, fap_level, ppa, server_r = parse_id_response(id_reply)
+        err_flag, channel, queue_manager, fap_level, ppa, server_r, swap = parse_id_response(id_reply)
         if err_flag not in (None, 0):
             return RawLoginResult(
                 ok=False,
@@ -761,7 +762,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
 
         stage = "caut"
         r_state = client_r + server_r
-        sock.sendall(build_caut_packet(args.user, password, fap_level or RFP_FAP_LEVEL, ppa or 0, r_state))
+        sock.sendall(build_caut_packet(args.user, password, fap_level or RFP_FAP_LEVEL, ppa or 0, r_state, swap))
         caut_reply = recv_tsh_packet(sock)
         caut_ok, caut_error = parse_status_packet(caut_reply)
         if not caut_ok:
