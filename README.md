@@ -4,6 +4,8 @@
 
 It connects to the target, checks the standard IBM MQ listener ports by default, sends an IBM MQ-style probe when no passive banner is returned, and parses the response into readable metadata.
 
+The repository also includes `mqlogin.py`, a separate single-credential connection tester for legitimate IBM MQ client authentication checks.
+
 ## Features
 
 - Checks the default IBM MQ TCP ports `1414` through `1419`
@@ -20,7 +22,14 @@ It connects to the target, checks the standard IBM MQ listener ports by default,
 
 No third-party Python packages are required.
 
+For `mqlogin.py`:
+
+- the default `raw` backend uses only the Python standard library
+- the optional `ibmmq` backend still requires the `ibmmq` Python package and IBM MQ C client libraries installed locally
+
 ## Usage
+
+### Listener Fingerprinting
 
 Show help:
 
@@ -53,6 +62,52 @@ Enable verbose debug output:
 ```bash
 python3 mqinfo.py 192.0.2.10 -d
 python3 mqinfo.py 192.0.2.10 -p 1414 -d
+```
+
+### Single-Credential Login Test
+
+Show help:
+
+```bash
+python3 mqlogin.py
+python3 mqlogin.py --help
+```
+
+Connect with an explicit username and prompted password:
+
+```bash
+python3 mqlogin.py 192.0.2.10 --qmgr QM1 --user app
+```
+
+Connect with a password from an environment variable:
+
+```bash
+export MQ_PASSWORD='your-password'
+python3 mqlogin.py 192.0.2.10 --qmgr QM1 --user app
+```
+
+Connect to a non-default port:
+
+```bash
+python3 mqlogin.py 192.0.2.10 --port 1415 --qmgr QM1 --user app
+```
+
+Force the packet-level Python backend:
+
+```bash
+python3 mqlogin.py 192.0.2.10 --backend raw --qmgr QM1 --user app
+```
+
+Force the IBM client-library backend:
+
+```bash
+python3 mqlogin.py 192.0.2.10 --backend ibmmq --qmgr QM1 --user app
+```
+
+Connect through a SOCKS5 proxy:
+
+```bash
+python3 mqlogin.py 192.0.2.10 --backend raw --socks 127.0.0.1:1080 --qmgr QM1 --user app
 ```
 
 ## Output
@@ -109,3 +164,7 @@ Debug mode additionally prints:
 - This tool is intended for identification and metadata extraction, not full IBM MQ administration.
 - It does not perform authenticated MQ operations.
 - Some MQ listeners may return responses that are only partially parsed.
+
+`mqlogin.py` tests one explicit credential set only. It does not perform username or password guessing.
+
+The `raw` backend is a direct Python implementation of the initial IBM MQ `ID` and `MQCONN/MQCSP` exchange based on IBM MQ Java client wire structures. It is intentionally narrow and best suited to straightforward TCP client-authentication checks against non-TLS listener channels.
