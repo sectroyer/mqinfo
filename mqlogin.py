@@ -1,6 +1,7 @@
 #!/usr/bin/env python3
 
 import argparse
+import codecs
 import getpass
 import ipaddress
 import os
@@ -9,7 +10,7 @@ import sys
 from dataclasses import dataclass
 
 
-SCRIPT_VERSION = "0.2.1"
+SCRIPT_VERSION = "0.2.2"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
@@ -24,6 +25,7 @@ MQCNO_VERSION_5 = 5
 MQCSP_VERSION_1 = 1
 MQCSP_AUTH_USER_ID_AND_PWD = 1
 RFP_FAP_LEVEL = 17
+LOCAL_CCSID = 819
 RFP_TST_INITIAL_INFO = 1
 RFP_TST_STATUS_INFO = 5
 RFP_TST_USERID_DATA = 8
@@ -201,6 +203,11 @@ def build_parser() -> argparse.ArgumentParser:
         default=CONNECT_TIMEOUT,
         help=f"TCP connect timeout in seconds (default: {CONNECT_TIMEOUT})",
     )
+    parser.add_argument(
+        "--debug",
+        action="store_true",
+        help="Print raw protocol metadata to stderr; passwords are never printed",
+    )
     return parser
 
 
@@ -342,13 +349,33 @@ def open_socket(
         raise
 
 
-def decode_ebcdic_strip(data: bytes) -> str:
-    return data.decode("cp500", errors="ignore").strip()
+def mq_codec(ccsid: int) -> str:
+    if ccsid == 819:
+        return "iso-8859-1"
+    try:
+        codecs.lookup(f"cp{ccsid}")
+    except LookupError:
+        if ccsid == 870:
+            # CP870 is not included with every Python build. CP500 has the
+            # same encoding for the ASCII subset used by MQ identifiers.
+            return "cp500"
+        raise ValueError(f"unsupported MQ CCSID: {ccsid}")
+    return f"cp{ccsid}"
 
 
-def encode_mq_field(value: str, size: int) -> bytes:
-    raw = value.encode("cp500", errors="ignore")[:size]
-    return raw.ljust(size, b"\x40")
+def encode_mq_bytes(value: str, ccsid: int) -> bytes:
+    return value.encode(mq_codec(ccsid), errors="strict")
+
+
+def decode_mq_field(data: bytes, ccsid: int) -> str:
+    return data.decode(mq_codec(ccsid), errors="ignore").strip()
+
+
+def encode_mq_field(value: str, size: int, ccsid: int = LOCAL_CCSID) -> bytes:
+    # RemoteConnection defaults to CCSID 819, which is ISO-8859-1. Channel
+    # names therefore travel as ASCII-compatible bytes, padded with spaces.
+    raw = encode_mq_bytes(value, ccsid)[:size]
+    return raw.ljust(size, encode_mq_bytes(" ", ccsid))
 
 
 def encode_ascii_field(value: str, size: int) -> bytes:
@@ -485,7 +512,7 @@ def remote_ppa_finish_auth_flow(
     return padded_length
 
 
-def build_tsh(segment_type: int, payload_length: int, control_flags1: int) -> bytes:
+def build_tsh(segment_type: int, payload_length: int, control_flags1: int, ccsid: int = LOCAL_CCSID) -> bytes:
     tsh = bytearray(TSH_HEADER_SIZE)
     tsh[0:4] = b"TSH "
     write_u32(tsh, 4, TSH_HEADER_SIZE + payload_length)
@@ -494,11 +521,11 @@ def build_tsh(segment_type: int, payload_length: int, control_flags1: int) -> by
     tsh[10] = control_flags1 & 0xFF
     tsh[11] = 0
     write_u32(tsh, 20, 1)
-    tsh[24:26] = (1208).to_bytes(2, "big")
+    tsh[24:26] = ccsid.to_bytes(2, "big")
     return bytes(tsh)
 
 
-def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes) -> bytes:
+def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes, ccsid: int = LOCAL_CCSID) -> bytes:
     payload = bytearray(240)
     # RfpID uses a literal ASCII eyecatcher, unlike the MQ character fields.
     payload[0:4] = b"ID  "
@@ -510,11 +537,11 @@ def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes) -> bytes:
     write_u32(payload, 12, 0x400)
     write_u32(payload, 16, 0)
     write_u32(payload, 20, 0)
-    payload[24:44] = encode_mq_field(channel, 20)
+    payload[24:44] = encode_mq_field(channel, 20, ccsid)
     payload[44] = 0x51
     payload[45] = 0
-    payload[46:48] = (1208).to_bytes(2, "big")
-    payload[48:96] = encode_mq_field(qmgr, 48)
+    payload[46:48] = ccsid.to_bytes(2, "big")
+    payload[48:96] = encode_mq_field(qmgr, 48, ccsid)
     write_u32(payload, 96, 300)
     payload[100:102] = (138).to_bytes(2, "big")
     payload[102] = 0
@@ -523,8 +550,8 @@ def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes) -> bytes:
     write_u32(payload, 128, 1)
     payload[132] = 0x28
     payload[133] = 0
-    payload[148:160] = encode_mq_field("MQJB00000000", 12)
-    payload[160:208] = encode_mq_field("PYMQLOGIN", 48)
+    payload[148:160] = encode_mq_field("MQJB00000000", 12, ccsid)
+    payload[160:208] = encode_mq_field("PYMQLOGIN", 48, ccsid)
     # Offer no protection and DES. The queue manager selects DES when its
     # CONNAUTH policy requires protected passwords.
     payload[208:210] = (0).to_bytes(2, "big")
@@ -532,7 +559,7 @@ def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes) -> bytes:
     for offset in range(212, 228, 2):
         payload[offset : offset + 2] = (0xFFFF).to_bytes(2, "big")
     payload[228:240] = client_r
-    tsh = build_tsh(RFP_TST_INITIAL_INFO, len(payload), 0x01 | RFP_TCF_FIRST | RFP_TCF_LAST)
+    tsh = build_tsh(RFP_TST_INITIAL_INFO, len(payload), 0x01 | RFP_TCF_FIRST | RFP_TCF_LAST, ccsid)
     return tsh + payload
 
 
@@ -620,22 +647,22 @@ def build_mqconn_packet(host: str, port: int, qmgr: str, channel: str, user: str
     return tsh + mqapi + call_body
 
 
-def build_uid_packet(user: str, fap_level: int) -> bytes:
+def build_uid_packet(user: str, fap_level: int, ccsid: int) -> bytes:
     payload_size = 28 if fap_level < 5 else 132
     payload = bytearray(payload_size)
     payload[0:4] = b"UID "
     short_user = user.upper()[:12]
-    payload[4:16] = encode_ascii_field(short_user, 12)
-    payload[16:28] = encode_ascii_field("", 12)
+    payload[4:16] = encode_mq_field(short_user, 12, ccsid)
+    payload[16:28] = encode_mq_field("", 12, ccsid)
     if fap_level >= 5:
-        payload[28:92] = encode_ascii_field(user, 64)
-    tsh = build_tsh(RFP_TST_USERID_DATA, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST)
+        payload[28:92] = encode_mq_field(user, 64, ccsid)
+    tsh = build_tsh(RFP_TST_USERID_DATA, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST, ccsid)
     return tsh + payload
 
 
-def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_state: bytes, swap: bool) -> bytes:
-    user_bytes = user.encode("ascii", errors="ignore")
-    password_bytes = password.encode("ascii", errors="ignore")
+def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_state: bytes, swap: bool, ccsid: int) -> bytes:
+    user_bytes = encode_mq_bytes(user, ccsid)
+    password_bytes = encode_mq_bytes(password, ccsid)
     user_id_offset = 32 if fap_level > 16 else 24
     payload = bytearray(user_id_offset + len(user_bytes) + len(password_bytes))
     payload[0:4] = b"CAUT"
@@ -656,7 +683,7 @@ def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_stat
     if new_password_len < 0:
         raise ValueError(f"unsupported MQ password protection algorithm: {ppa}")
     write_u32_ordered(payload, 20, new_password_len, swap)
-    tsh = build_tsh(RFP_TST_CONAUTH_INFO, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST)
+    tsh = build_tsh(RFP_TST_CONAUTH_INFO, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST, ccsid)
     return tsh + payload
 
 
@@ -669,19 +696,39 @@ def recv_tsh_packet(sock: socket.socket) -> bytes:
     return header + body
 
 
-def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None, int | None, int | None, bytes, bool]:
-    if len(packet) < TSH_HEADER_SIZE + 104:
-        return None, None, None, None, None, b"", False
+def debug_tsh(args: argparse.Namespace, direction: str, stage: str, packet: bytes) -> None:
+    """Emit enough wire metadata to diagnose protocol negotiation safely."""
+    if not args.debug:
+        return
+    if len(packet) < TSH_HEADER_SIZE:
+        print(f"[debug] {direction} {stage}: {len(packet)} bytes (short TSH)", file=sys.stderr)
+        return
+    print(
+        f"[debug] {direction} {stage}: bytes={len(packet)} segment={packet[9]} "
+        f"flags=0x{packet[10]:02x} encoding={packet[8]} ccsid="
+        f"{int.from_bytes(packet[24:26], 'big')}",
+        file=sys.stderr,
+    )
+
+
+def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None, int | None, int | None, bytes, bool, int]:
+    if len(packet) < TSH_HEADER_SIZE + 8:
+        return None, None, None, None, None, b"", False, LOCAL_CCSID
     base = TSH_HEADER_SIZE
+    ccsid = int.from_bytes(packet[24:26], "big", signed=False)
     fap_level = packet[base + 4]
     err = packet[base + 7]
-    channel = decode_ebcdic_strip(packet[base + 24 : base + 44]) or None
-    queue_manager = decode_ebcdic_strip(packet[base + 48 : base + 96]) or None
+    channel = None
+    if len(packet) >= base + 44:
+        channel = decode_mq_field(packet[base + 24 : base + 44], ccsid) or None
+    queue_manager = None
+    if len(packet) >= base + 96:
+        queue_manager = decode_mq_field(packet[base + 48 : base + 96], ccsid) or None
     ppa = None
     if len(packet) >= base + 210:
         ppa = int.from_bytes(packet[base + 208 : base + 210], "big", signed=False)
     server_r = packet[base + 228 : base + 240] if len(packet) >= base + 240 else b""
-    return err, channel, queue_manager, fap_level, ppa, server_r, packet[8] == 2
+    return err, channel, queue_manager, fap_level, ppa, server_r, packet[8] == 2, ccsid
 
 
 def parse_mqconn_reply(packet: bytes) -> RawLoginResult:
@@ -716,16 +763,66 @@ def parse_status_packet(packet: bytes) -> tuple[bool, str | None]:
     return True, None
 
 
+def describe_error_status(packet: bytes) -> str:
+    """Decode the RfpESH body used with an error/close status TSH."""
+    if len(packet) < TSH_HEADER_SIZE + 8:
+        return "short error status flow"
+    swap = packet[8] == 2
+    error_data_length = read_u32_ordered(packet, TSH_HEADER_SIZE, swap)
+    return_code = read_u32_ordered(packet, TSH_HEADER_SIZE + 4, swap)
+    return (
+        f"{RFP_ERR_CODES.get(return_code, f'unknown error {return_code}')} "
+        f"(return_code={return_code}, error_data_bytes={error_data_length})"
+    )
+
+
 def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
     stage = "connect"
     sock = open_socket(args.host, args.port, args.socks, args.timeout)
     try:
         sock.settimeout(READ_TIMEOUT)
-        stage = "id"
-        client_r = os.urandom(12)
-        sock.sendall(build_initial_id_packet(args.channel, args.qmgr, client_r))
-        id_reply = recv_tsh_packet(sock)
-        err_flag, channel, queue_manager, fap_level, ppa, server_r, swap = parse_id_response(id_reply)
+        active_ccsid = LOCAL_CCSID
+        for id_attempt in range(2):
+            stage = "id-send"
+            client_r = os.urandom(12)
+            id_packet = build_initial_id_packet(args.channel, args.qmgr, client_r, active_ccsid)
+            debug_tsh(args, "tx", stage, id_packet)
+            sock.sendall(id_packet)
+            stage = "id-recv"
+            id_reply = recv_tsh_packet(sock)
+            debug_tsh(args, "rx", stage, id_reply)
+            if id_reply[9] != RFP_TST_INITIAL_INFO:
+                status_detail = ""
+                if id_reply[9] == RFP_TST_STATUS_INFO:
+                    status_detail = f": {describe_error_status(id_reply)}"
+                return RawLoginResult(
+                    ok=False,
+                    stage=stage,
+                    error_text=f"expected INITIAL_INFO reply, received segment {id_reply[9]}{status_detail}",
+                )
+            err_flag, channel, queue_manager, fap_level, ppa, server_r, swap, remote_ccsid = parse_id_response(id_reply)
+            if args.debug:
+                print(
+                    f"[debug] negotiated: fap={fap_level} ppa={ppa} byte_order="
+                    f"{'little' if swap else 'big'} remote_ccsid={remote_ccsid} "
+                    f"server_r_bytes={len(server_r)} id_error={bool(id_reply[10] & 0x02)}",
+                    file=sys.stderr,
+                )
+            if id_reply[10] & 0x02:
+                if id_attempt == 0 and remote_ccsid != active_ccsid:
+                    active_ccsid = remote_ccsid
+                    continue
+                return RawLoginResult(
+                    ok=False,
+                    queue_manager=queue_manager,
+                    channel=channel,
+                    fap_level=fap_level,
+                    stage=stage,
+                    error_text="queue manager rejected initial negotiation after CCSID retry",
+                )
+            break
+        else:
+            raise AssertionError("initial negotiation did not complete")
         if err_flag not in (None, 0):
             return RawLoginResult(
                 ok=False,
@@ -756,14 +853,27 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                 error_text="queue manager selected DES password protection without an R value",
             )
 
-        stage = "uid"
+        stage = "uid-send"
         uid_user = getpass.getuser()
-        sock.sendall(build_uid_packet(uid_user, fap_level or RFP_FAP_LEVEL))
+        uid_packet = build_uid_packet(uid_user, fap_level or RFP_FAP_LEVEL, active_ccsid)
+        debug_tsh(args, "tx", stage, uid_packet)
+        sock.sendall(uid_packet)
 
-        stage = "caut"
+        stage = "caut-send"
         r_state = client_r + server_r
-        sock.sendall(build_caut_packet(args.user, password, fap_level or RFP_FAP_LEVEL, ppa or 0, r_state, swap))
+        caut_packet = build_caut_packet(args.user, password, fap_level or RFP_FAP_LEVEL, ppa or 0, r_state, swap, active_ccsid)
+        debug_tsh(args, "tx", stage, caut_packet)
+        if args.debug:
+            print(
+                f"[debug] CAUT: fap={fap_level or RFP_FAP_LEVEL} ppa={ppa or 0} "
+                f"user_bytes={len(encode_mq_bytes(args.user, active_ccsid))} "
+                f"password_bytes={len(encode_mq_bytes(password, active_ccsid))}",
+                file=sys.stderr,
+            )
+        sock.sendall(caut_packet)
+        stage = "caut-recv"
         caut_reply = recv_tsh_packet(sock)
+        debug_tsh(args, "rx", stage, caut_reply)
         caut_ok, caut_error = parse_status_packet(caut_reply)
         if not caut_ok:
             return RawLoginResult(
@@ -775,14 +885,18 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                 error_text=caut_error,
             )
 
-        stage = "mqconn"
-        sock.sendall(build_mqconn_packet(args.host, args.port, args.qmgr, args.channel, args.user, password))
+        stage = "mqconn-send"
+        mqconn_packet = build_mqconn_packet(args.host, args.port, args.qmgr, args.channel, args.user, password)
+        debug_tsh(args, "tx", stage, mqconn_packet)
+        sock.sendall(mqconn_packet)
+        stage = "mqconn-recv"
         conn_reply = recv_tsh_packet(sock)
+        debug_tsh(args, "rx", stage, conn_reply)
         result = parse_mqconn_reply(conn_reply)
         result.queue_manager = queue_manager
         result.channel = channel
         result.fap_level = fap_level
-        result.stage = stage
+        result.stage = "mqconn"
         return result
     except Exception as exc:
         return RawLoginResult(ok=False, stage=stage, error_text=str(exc))
