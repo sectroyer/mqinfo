@@ -12,7 +12,8 @@ DEFAULT_PORTS = [1414, 1415, 1416, 1417, 1418, 1419]
 CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 2.0
 MAX_READ = 4096
-SCRIPT_VERSION = "0.2.0"
+SCRIPT_VERSION = "0.2.2"
+BANNER_TITLE = "IBM MQ Info Tool"
 IBM_MQ_PROBE = (
     b"TSH\x20\x00\x00\x00\xEC\x01\x01\x31\x00\x00\x00\x00\x00\x00\x00\x00"
     b"\x00\x00\x00\x01\x11\x04\xB8\x00\x00\x49\x44\x20\x20\x0A\x26\x00\x00"
@@ -31,8 +32,14 @@ IBM_MQ_PROBE = (
 VERSION_PATTERN = re.compile(r"MQMV(\d{2})(\d{2})(\d{2})(\d{2})([A-Z0-9]{4})\.(\S+)")
 
 
-def parse_args() -> argparse.Namespace:
-    parser = argparse.ArgumentParser(
+class BannerArgumentParser(argparse.ArgumentParser):
+    def format_help(self) -> str:
+        banner = f"\n{BANNER_TITLE} v{SCRIPT_VERSION}\n\n"
+        return banner + super().format_help() + "\n"
+
+
+def build_parser() -> argparse.ArgumentParser:
+    parser = BannerArgumentParser(
         description="Probe a host for IBM MQ listeners and print parsed listener metadata."
     )
     parser.add_argument("host", help="Target host or IP address")
@@ -48,6 +55,14 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="Print raw response details in addition to parsed MQ metadata",
     )
+    return parser
+
+
+def parse_args() -> argparse.Namespace:
+    parser = build_parser()
+    if len(sys.argv) == 1:
+        parser.print_help()
+        raise SystemExit(0)
     return parser.parse_args()
 
 
@@ -230,7 +245,8 @@ def main() -> int:
     args = parse_args()
     ports = [args.port] if args.port else DEFAULT_PORTS
 
-    print(f"mqinfo.py v{SCRIPT_VERSION}")
+    print()
+    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}")
     print()
 
     rc = 0
