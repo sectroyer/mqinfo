@@ -12,7 +12,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SCRIPT_VERSION = "0.2.10"
+SCRIPT_VERSION = "0.2.11"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
