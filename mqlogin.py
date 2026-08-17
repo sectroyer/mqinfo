@@ -11,7 +11,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 
-SCRIPT_VERSION = "0.2.5"
+SCRIPT_VERSION = "0.2.6"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
@@ -132,6 +132,11 @@ def authorization_summary(result: RawLoginResult) -> str:
             "failed (MQRC_NOT_AUTHORIZED): the effective MQ identity is not permitted "
             "to connect to this queue manager"
         )
+    if result.stage == "caut-recv":
+        return (
+            "failed during CONNAUTH: the queue manager rejected the supplied "
+            f"authentication data ({result.error_text or 'unknown status error'})"
+        )
     if result.reason_code is not None:
         return f"not confirmed ({format_mqrc(result.reason_code)}): {result.error_text or 'MQCONN failed'}"
     return f"not confirmed: {result.error_text or 'MQCONN did not complete'}"
@@ -247,6 +252,11 @@ def build_parser() -> argparse.ArgumentParser:
         action="store_true",
         help="Print raw protocol metadata to stderr; passwords are never printed",
     )
+    parser.add_argument(
+        "--verbose",
+        action="store_true",
+        help="Show full per-credential reports when using --creds",
+    )
     return parser
 
 
@@ -264,6 +274,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("provide exactly one of --user or --creds")
     if args.creds and args.password is not None:
         parser.error("--password cannot be used with --creds")
+    if args.creds and args.debug and not args.verbose:
+        parser.error("--debug with --creds requires --verbose")
     return args
 
 
@@ -850,7 +862,7 @@ def parse_status_packet(packet: bytes) -> tuple[bool, str | None]:
     if segment_type != RFP_TST_STATUS_INFO:
         return False, f"unexpected reply segment type {segment_type}"
     if control_flags1 & 0x02:
-        return False, "server returned error status flow"
+        return False, f"server returned error status flow: {describe_error_status(packet)}"
     return True, None
 
 
@@ -875,9 +887,11 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
         active_ccsid = LOCAL_CCSID
         id_flags2 = 0x51
         id_flags3 = 0x28
+        # RemoteConnection retains this R value while it retries ID
+        # negotiation. It is one half of the later DES password key state.
+        client_r = os.urandom(12)
         for id_attempt in range(4):
             stage = "id-send"
-            client_r = os.urandom(12)
             id_packet = build_initial_id_packet(
                 args.channel, args.qmgr, client_r, active_ccsid, id_flags2, id_flags3
             )
@@ -1059,10 +1073,7 @@ def connect_and_report(args: argparse.Namespace, password: str | None = None, sh
     print(f"    user: {args.user}")
     print(f"    backend: {backend}")
 
-    if backend == "raw":
-        result = connect_with_raw(args, password)
-    else:
-        result = connect_with_ibmmq(args, password)
+    result = connect_with_selected_backend(args, password, backend)
 
     if result.ok:
         print("    login: success")
@@ -1092,6 +1103,20 @@ def connect_and_report(args: argparse.Namespace, password: str | None = None, sh
     return 1
 
 
+def connect_with_selected_backend(args: argparse.Namespace, password: str, backend: str) -> RawLoginResult:
+    if backend == "raw":
+        return connect_with_raw(args, password)
+    return connect_with_ibmmq(args, password)
+
+
+def credential_result_line(username: str, result: RawLoginResult) -> str:
+    if result.ok:
+        return f"{username}: success / MQRC 0 (MQRC_NONE)"
+    if result.reason_code is not None:
+        return f"{username}: failed / MQRC {format_mqrc(result.reason_code)}"
+    return f"{username}: failed / {result.error_text or 'MQCONN did not complete'}"
+
+
 def check_credentials_file(args: argparse.Namespace) -> int:
     credentials = read_credentials_file(args.creds)
     print()
@@ -1100,21 +1125,34 @@ def check_credentials_file(args: argparse.Namespace) -> int:
     print(f"[+] Checking {len(credentials)} credential pair(s) sequentially")
 
     successes = 0
+    backend = choose_backend(args)
     for index, (username, password) in enumerate(credentials, start=1):
-        print(f"\n[{index}/{len(credentials)}]")
         args.user = username
-        if connect_and_report(args, password, show_banner=False) == 0:
+        if args.verbose:
+            print(f"\n[{index}/{len(credentials)}]")
+            if connect_and_report(args, password, show_banner=False) == 0:
+                successes += 1
+            continue
+
+        result = connect_with_selected_backend(args, password, backend)
+        print(credential_result_line(username, result))
+        if result.ok:
             successes += 1
 
     failures = len(credentials) - successes
     print(f"[+] Summary: {successes} authorized, {failures} not authorized or not confirmed")
+    print()
     return 0 if failures == 0 else 1
 
 
 def main() -> int:
     args = parse_args()
     if args.creds:
-        return check_credentials_file(args)
+        try:
+            return check_credentials_file(args)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
     return connect_and_report(args)
 
 

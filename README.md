@@ -93,6 +93,9 @@ non-comment line is `username:password`; passwords may contain `:`.
 python3 mqlogin.py 192.0.2.10 --backend raw --qmgr QM1 --creds credentials.txt
 ```
 
+By default this mode prints one result line per username. Add `--verbose` for
+the full per-attempt protocol report; use `--debug` only with `--verbose`.
+
 Connect to a non-default port:
 
 ```bash
