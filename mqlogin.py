@@ -6,12 +6,13 @@ import getpass
 import ipaddress
 import os
 import socket
+import ssl
 import sys
 from dataclasses import dataclass
 from pathlib import Path
 
 
-SCRIPT_VERSION = "0.2.9"
+SCRIPT_VERSION = "0.2.10"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
@@ -84,6 +85,11 @@ RFP_ERR_CODES = {
     255: "COMMIT_INTERVAL",
 }
 
+PASSWORD_PROTECTION_ALGORITHMS = {
+    0: "none (no protocol-level password protection; use TLS)",
+    1: "DES-based protected password (legacy protection; TLS is still required for transport security)",
+}
+
 MQRC_NAMES = {
     0: "MQRC_NONE",
     2009: "MQRC_CONNECTION_BROKEN",
@@ -115,6 +121,7 @@ class RawLoginResult:
     queue_manager: str | None = None
     channel: str | None = None
     fap_level: int | None = None
+    password_protection: int | None = None
     stage: str | None = None
     error_text: str | None = None
 
@@ -122,6 +129,10 @@ class RawLoginResult:
 def format_mqrc(reason_code: int) -> str:
     name = MQRC_NAMES.get(reason_code)
     return f"{reason_code} ({name})" if name else str(reason_code)
+
+
+def format_password_protection(algorithm: int) -> str:
+    return PASSWORD_PROTECTION_ALGORITHMS.get(algorithm, f"unknown algorithm {algorithm}")
 
 
 def authorization_summary(result: RawLoginResult) -> str:
@@ -197,7 +208,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser = BannerArgumentParser(
         description="Test a single IBM MQ client login with an explicit username/password."
     )
-    parser.add_argument("host", help="Target host or IP address")
+    parser.add_argument("host", nargs="?", help="Target host or IP address")
+    parser.add_argument(
+        "--list-backends",
+        action="store_true",
+        help="Probe remote plaintext/TLS transports when HOST is supplied; otherwise list local backends",
+    )
     parser.add_argument(
         "--port",
         "-p",
@@ -268,6 +284,10 @@ def parse_args() -> argparse.Namespace:
         parser.print_help()
         raise SystemExit(0)
     args = parser.parse_args()
+    if args.list_backends:
+        return args
+    if not args.host:
+        parser.error("host is required unless --list-backends is used")
     if not 1 <= args.port <= 65535:
         parser.error("port must be between 1 and 65535")
     if args.timeout <= 0:
@@ -766,10 +786,12 @@ def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_stat
     payload[user_id_offset : user_id_offset + len(user_bytes)] = user_bytes
     password_offset = user_id_offset + len(user_bytes)
     payload[password_offset : password_offset + len(password_bytes)] = password_bytes
-    new_password_len = remote_ppa_finish_auth_flow(payload, 20, password_offset, r_state, ppa, swap)
-    if new_password_len < 0:
+    protected_password_len = remote_ppa_finish_auth_flow(payload, 20, password_offset, r_state, ppa, swap)
+    if protected_password_len < 0:
         raise ValueError(f"unsupported MQ password protection algorithm: {ppa}")
-    write_u32_ordered(payload, 20, new_password_len, swap)
+    # RfpCAUT keeps PasswordLen as the original password byte count. The Java
+    # client uses the padded protected length only when calculating TSH length.
+    # `payload` grows when RemotePPA writes the DES-padded bytes.
     tsh = build_tsh(RFP_TST_CONAUTH_INFO, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST, ccsid)
     return tsh + payload
 
@@ -935,6 +957,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                     queue_manager=queue_manager,
                     channel=channel,
                     fap_level=fap_level,
+                    password_protection=ppa,
                     stage=stage,
                     error_text="queue manager rejected initial negotiation without a supported retry change",
                 )
@@ -947,6 +970,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                 queue_manager=queue_manager,
                 channel=channel,
                 fap_level=fap_level,
+                password_protection=ppa,
                 stage=stage,
                 error_text=f"listener rejected initial ID with {RFP_ERR_CODES.get(err_flag, err_flag)}",
             )
@@ -958,6 +982,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                 queue_manager=queue_manager,
                 channel=channel,
                 fap_level=fap_level,
+                password_protection=ppa,
                 stage=stage,
                 error_text=f"queue manager selected unsupported password protection algorithm: {ppa}",
             )
@@ -967,6 +992,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                 queue_manager=queue_manager,
                 channel=channel,
                 fap_level=fap_level,
+                password_protection=ppa,
                 stage=stage,
                 error_text="queue manager selected DES password protection without an R value",
             )
@@ -999,6 +1025,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                 queue_manager=queue_manager,
                 channel=channel,
                 fap_level=fap_level,
+                password_protection=ppa,
                 stage=stage,
                 error_text=caut_error,
             )
@@ -1014,6 +1041,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
         result.queue_manager = queue_manager
         result.channel = channel
         result.fap_level = fap_level
+        result.password_protection = ppa
         result.stage = "mqconn"
         return result
     except Exception as exc:
@@ -1059,6 +1087,71 @@ def choose_backend(args: argparse.Namespace) -> str:
         return "raw"
 
 
+def list_backends() -> int:
+    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}\n")
+    print("raw: available (built in; plaintext TCP only, no TLS support)")
+    try:
+        import ibmmq  # type: ignore  # noqa: F401
+    except ImportError:
+        print("ibmmq: unavailable (requires the ibmmq package and IBM MQ C client libraries)")
+        print("auto: raw")
+    else:
+        print("ibmmq: available (IBM MQ client library backend; supports configured TLS)")
+        print("auto: ibmmq")
+    return 0
+
+
+def describe_initial_reply(packet: bytes) -> str:
+    if len(packet) < TSH_HEADER_SIZE:
+        return "not confirmed (short MQ reply)"
+    if packet[9] == RFP_TST_INITIAL_INFO:
+        return "available (MQ INITIAL_INFO reply)"
+    if packet[9] == RFP_TST_STATUS_INFO:
+        return f"reachable ({describe_error_status(packet)})"
+    return f"not confirmed (unexpected MQ segment {packet[9]})"
+
+
+def probe_remote_transport(args: argparse.Namespace, tls: bool) -> str:
+    sock: socket.socket | ssl.SSLSocket | None = None
+    try:
+        sock = open_socket(args.host, args.port, args.socks, args.timeout)
+        if tls:
+            # This is a capability probe, not an authenticated connection:
+            # show whether the listener can complete TLS before sending MQ ID.
+            context = ssl.SSLContext(ssl.PROTOCOL_TLS_CLIENT)
+            context.check_hostname = False
+            context.verify_mode = ssl.CERT_NONE
+            sock = context.wrap_socket(sock, server_hostname=args.host)
+            tls_version = sock.version() or "unknown TLS version"
+            cipher = sock.cipher()
+            cipher_name = cipher[0] if cipher else "unknown cipher"
+        sock.settimeout(READ_TIMEOUT)
+        packet = build_initial_id_packet(args.channel, args.qmgr, os.urandom(12))
+        debug_tsh(args, "tx", "transport-id-send", packet)
+        sock.sendall(packet)
+        reply = recv_tsh_packet(sock)
+        debug_tsh(args, "rx", "transport-id-recv", reply)
+        result = describe_initial_reply(reply)
+        if tls:
+            return f"{result}; {tls_version}, {cipher_name}"
+        return result
+    except Exception as exc:
+        return f"not confirmed ({exc})"
+    finally:
+        if sock is not None:
+            sock.close()
+
+
+def list_remote_backends(args: argparse.Namespace) -> int:
+    print(f"{BANNER_TITLE} v{SCRIPT_VERSION}\n")
+    print(f"[+] Probing connection types on {args.host}:{args.port}")
+    print(f"    channel: {args.channel}")
+    print(f"    plaintext RFP: {probe_remote_transport(args, tls=False)}")
+    print(f"    TLS RFP: {probe_remote_transport(args, tls=True)}")
+    print("    TLS note: certificate validation is disabled for this capability probe")
+    return 0
+
+
 def connect_and_report(args: argparse.Namespace, password: str | None = None, show_banner: bool = True) -> int:
     if password is None:
         password = resolve_password(args)
@@ -1080,6 +1173,8 @@ def connect_and_report(args: argparse.Namespace, password: str | None = None, sh
     if result.ok:
         print("    login: success")
         print(f"    authorization: {authorization_summary(result)}")
+        if result.password_protection is not None:
+            print(f"    password protection: {format_password_protection(result.password_protection)}")
         if result.queue_manager:
             print(f"    connected queue manager: {result.queue_manager}")
         if result.channel:
@@ -1096,6 +1191,8 @@ def connect_and_report(args: argparse.Namespace, password: str | None = None, sh
         print(f"    mqrc: {format_mqrc(result.reason_code)}")
     if result.fap_level is not None:
         print(f"    fap_level: {result.fap_level}")
+    if result.password_protection is not None:
+        print(f"    password protection: {format_password_protection(result.password_protection)}")
     if result.stage:
         print(f"    stage: {result.stage}")
     if result.error_text:
@@ -1149,6 +1246,8 @@ def check_credentials_file(args: argparse.Namespace) -> int:
 
 def main() -> int:
     args = parse_args()
+    if args.list_backends:
+        return list_remote_backends(args) if args.host else list_backends()
     if args.creds:
         try:
             return check_credentials_file(args)

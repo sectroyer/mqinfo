@@ -74,6 +74,21 @@ python3 mqlogin.py
 python3 mqlogin.py --help
 ```
 
+List local connection backends without contacting a server:
+
+```bash
+python3 mqlogin.py --list-backends
+```
+
+Supply a host to probe whether the listener accepts a plaintext RFP initial
+flow and/or a TLS-wrapped RFP initial flow. This sends no credentials or
+`MQCONN`; TLS certificate validation is disabled because this is a capability
+probe, not a trusted client connection.
+
+```bash
+python3 mqlogin.py 192.0.2.10 --channel APP.SVRCONN --list-backends
+```
+
 Connect with an explicit username and prompted password:
 
 ```bash
@@ -108,6 +123,10 @@ Force the packet-level Python backend:
 ```bash
 python3 mqlogin.py 192.0.2.10 --backend raw --qmgr QM1 --user app
 ```
+
+The raw backend reports the negotiated password-protection algorithm. It offers
+only `0` (none) and `1` (DES-based protected password); either result is
+separate from TLS transport security.
 
 Force the IBM client-library backend:
 
