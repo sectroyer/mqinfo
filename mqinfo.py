@@ -13,7 +13,7 @@ DEFAULT_PORTS = [1414, 1415, 1416, 1417, 1418, 1419]
 CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 2.0
 MAX_READ = 4096
-SCRIPT_VERSION = "0.2.6"
+SCRIPT_VERSION = "0.2.10"
 BANNER_TITLE = "IBM MQ Info Tool"
 TSH_HEADER_SIZE = 28
 IBM_MQ_PROBE = (
@@ -32,6 +32,96 @@ IBM_MQ_PROBE = (
     b"\x20\x20\x20\x20\x20\x20\x20\x20\x20\x20"
 )
 VERSION_PATTERN = re.compile(r"MQMV(\d{2})(\d{2})(\d{2})(\d{2})([A-Z0-9]{4})\.(\S+)")
+RFP_ICF_FLAGS = [
+    (0x01, "MSG_SEQ_NO"),
+    (0x02, "CONVERSION_CAPABLE"),
+    (0x04, "SPLIT_MESSAGES"),
+    (0x08, "REQUEST_INITIATION"),
+    (0x10, "REQUEST_SECURITY"),
+    (0x20, "MQREQUEST"),
+    (0x40, "SVRCONN_SECURITY"),
+    (0x80, "RUNTIME_APP"),
+]
+RFP_ICF2_FLAGS = [
+    (0x01, "DIST_LIST_CAPABLE"),
+    (0x02, "FAST_MESSAGES_REQUIRED"),
+    (0x04, "RESPONDER_CONVERSION"),
+    (0x08, "DUAL_UOW"),
+    (0x10, "XAREQUEST"),
+    (0x20, "XARUNTIME_APP"),
+    (0x40, "SPIREQUEST"),
+    (0x80, "TRACE_ROUTE_CAPABLE"),
+]
+RFP_ICF3_FLAGS = [
+    (0x01, "MSG_PROP_CAPABLE"),
+    (0x08, "MULTIPLEX_SYNCGET"),
+    (0x10, "PWD_PROT_ALWAYS"),
+    (0x20, "RET_CONTAG_CAPABLE"),
+]
+RFP_IEF_FLAGS = [
+    (0x01, "CCSID_NOT_SUPPORTED"),
+    (0x02, "ENCODING_INVALID"),
+    (0x04, "MAX_TRANSMISSION_SIZE"),
+    (0x08, "FAP_LEVEL"),
+    (0x10, "MAX_MSG_SIZE"),
+    (0x20, "MAX_MSG_PER_BATCH"),
+    (0x40, "SEQ_WRAP_VALUE"),
+    (0x80, "HEARTBEAT_INTERVAL"),
+]
+RFP_IEF2_FLAGS = [
+    (0x01, "HDRCOMPLIST"),
+    (0x02, "MSGCOMPLIST"),
+    (0x04, "SSL_RESET"),
+]
+RFP_IEF3_FLAGS = [
+    (0x01, "MSG_PROP_CAPABLE"),
+    (0x02, "MULTICAST_CAPABLE"),
+    (0x04, "MSG_PROP_INT_SEPARATE"),
+    (0x08, "MULTIPLEX_SYNCGET"),
+    (0x10, "PROT_ALGORITHMS"),
+    (0x20, "RET_CONTAG_CAPABLE"),
+]
+RFP_ERR_CODES = {
+    0: "NONE",
+    1: "NO_CHANNEL",
+    2: "CHANNEL_WRONG_TYPE",
+    3: "QM_UNAVAILABLE",
+    4: "MSG_SEQUENCE_ERROR",
+    5: "QM_TERMINATING",
+    6: "CAN_NOT_STORE",
+    7: "USER_CLOSED",
+    8: "TIMEOUT_EXPIRED",
+    9: "TARGET_Q_UNKNOWN",
+    10: "PROTOCOL_SEGMENT_TYPE",
+    11: "PROTOCOL_LENGTH_ERROR",
+    12: "PROTOCOL_INVALID_DATA",
+    13: "PROTOCOL_SEGMENT_ERROR",
+    14: "PROTOCOL_ID_ERROR",
+    15: "PROTOCOL_MSH_ERROR",
+    16: "PROTOCOL_GENERAL",
+    17: "BATCH_FAILURE",
+    18: "MESSAGE_LENGTH_ERROR",
+    19: "SEGMENT_NUMBER_ERROR",
+    20: "SECURITY_FAILURE",
+    21: "WRAP_VALUE_ERROR",
+    22: "CHANNEL_UNAVAILABLE",
+    23: "CLOSED_BY_EXIT",
+    24: "CIPHER_SPEC",
+    25: "PEER_NAME",
+    26: "SSL_CLIENT_CERTIFICATE",
+    27: "RMT_RSRCS_IN_RECOVERY",
+    28: "SSL_REFRESHING",
+    29: "INVALID_HOBJ",
+    30: "CONV_ID_ERROR",
+    31: "SOCKET_ACTION_TYPE",
+    32: "STANDBY_Q_MGR",
+    36: "PASSWORD_PROTECTION",
+    37: "MAX_CONNS_LIMIT_REACHED",
+    38: "SSL_INVALID_RESET",
+    39: "LUWID_MISMATCH",
+    40: "CERT_NOT_SELECTED",
+    255: "COMMIT_INTERVAL",
+}
 
 
 class BannerArgumentParser(argparse.ArgumentParser):
@@ -60,6 +150,11 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument(
         "--socks",
         help="Connect through a SOCKS5 proxy specified as host:port or socks5://host:port",
+    )
+    parser.add_argument(
+        "--flags",
+        action="store_true",
+        help="Show raw MQ ID/IDE/error flag fields from the listener response",
     )
     return parser
 
@@ -110,6 +205,15 @@ def parse_mq_version(raw_version: str) -> str:
 
 def wrap_version(raw_version: str) -> List[str]:
     return [raw_version[i : i + 2] for i in range(0, len(raw_version), 2)]
+
+
+def decode_flag_bits(value: int, definitions: list[tuple[int, str]]) -> str:
+    names = [name for mask, name in definitions if value & mask]
+    return ",".join(names) if names else "none"
+
+
+def decode_err_code(value: int) -> str:
+    return RFP_ERR_CODES.get(value, "unknown")
 
 
 def parse_socks_proxy(proxy: str) -> tuple[str, int]:
@@ -231,6 +335,41 @@ def extract_mq_metadata(data: bytes) -> Dict[str, str]:
     if tsh_ccsid:
         metadata["tsh_ccsid"] = str(tsh_ccsid)
 
+    fap_level = data[id_base + 4]
+    if fap_level:
+        metadata["fap_level"] = str(fap_level)
+
+    metadata["id_flags"] = f"0x{data[id_base + 5]:02x}"
+    metadata["id_flags_decoded"] = decode_flag_bits(data[id_base + 5], RFP_ICF_FLAGS)
+    metadata["ide_flags"] = f"0x{data[id_base + 6]:02x}"
+    metadata["ide_flags_decoded"] = decode_flag_bits(data[id_base + 6], RFP_IEF_FLAGS)
+    metadata["err_flags"] = f"0x{data[id_base + 7]:02x}"
+    metadata["err_flags_decoded"] = decode_err_code(data[id_base + 7])
+
+    max_messages_per_batch = int.from_bytes(
+        data[id_base + 10 : id_base + 12], byteorder="big", signed=False
+    )
+    if max_messages_per_batch:
+        metadata["max_messages_per_batch"] = str(max_messages_per_batch)
+
+    max_transmission_size = int.from_bytes(
+        data[id_base + 12 : id_base + 16], byteorder="big", signed=False
+    )
+    if max_transmission_size:
+        metadata["max_transmission_size"] = str(max_transmission_size)
+
+    max_message_size = int.from_bytes(
+        data[id_base + 16 : id_base + 20], byteorder="big", signed=False
+    )
+    if max_message_size:
+        metadata["max_message_size"] = str(max_message_size)
+
+    message_sequence_wrap_value = int.from_bytes(
+        data[id_base + 20 : id_base + 24], byteorder="big", signed=False
+    )
+    if message_sequence_wrap_value:
+        metadata["message_sequence_wrap_value"] = str(message_sequence_wrap_value)
+
     channel = decode_ebcdic_strip(data[id_base + 24 : id_base + 44])
     if channel:
         metadata["channel"] = channel
@@ -243,12 +382,62 @@ def extract_mq_metadata(data: bytes) -> Dict[str, str]:
         ccsid = int.from_bytes(data[id_base + 46 : id_base + 48], byteorder="big", signed=False)
         if ccsid:
             metadata["ccsid"] = str(ccsid)
+        metadata["id_flags_2"] = f"0x{data[id_base + 44]:02x}"
+        metadata["id_flags_2_decoded"] = decode_flag_bits(data[id_base + 44], RFP_ICF2_FLAGS)
+        metadata["ide_flags_2"] = f"0x{data[id_base + 45]:02x}"
+        metadata["ide_flags_2_decoded"] = decode_flag_bits(data[id_base + 45], RFP_IEF2_FLAGS)
 
     if len(data) >= id_base + 100:
         heartbeat_interval = int.from_bytes(
             data[id_base + 96 : id_base + 100], byteorder="big", signed=False
         )
         metadata["heartbeat_interval"] = str(heartbeat_interval)
+
+        efl_length = int.from_bytes(data[id_base + 100 : id_base + 102], byteorder="big", signed=False)
+        if efl_length:
+            metadata["efl_length"] = str(efl_length)
+        metadata["err_flags_2"] = f"0x{data[id_base + 102]:02x}"
+
+    if len(data) >= id_base + 124:
+        header_compression = [value for value in data[id_base + 104 : id_base + 106] if value != 0xFF]
+        if header_compression:
+            metadata["header_compression"] = ",".join(str(value) for value in header_compression)
+
+        message_compression = [
+            value for value in data[id_base + 106 : id_base + 122] if value != 0xFF
+        ]
+        if message_compression:
+            metadata["message_compression"] = ",".join(str(value) for value in message_compression)
+
+    if len(data) >= id_base + 132:
+        ssl_key_reset = int.from_bytes(
+            data[id_base + 124 : id_base + 128], byteorder="big", signed=False
+        )
+        if ssl_key_reset:
+            metadata["ssl_key_reset"] = str(ssl_key_reset)
+
+        conversations_per_socket = int.from_bytes(
+            data[id_base + 128 : id_base + 132], byteorder="big", signed=False
+        )
+        if conversations_per_socket:
+            metadata["conversations_per_socket"] = str(conversations_per_socket)
+        metadata["id_flags_3"] = f"0x{data[id_base + 132]:02x}"
+        metadata["id_flags_3_decoded"] = decode_flag_bits(data[id_base + 132], RFP_ICF3_FLAGS)
+        metadata["ide_flags_3"] = f"0x{data[id_base + 133]:02x}"
+        metadata["ide_flags_3_decoded"] = decode_flag_bits(data[id_base + 133], RFP_IEF3_FLAGS)
+
+    if len(data) >= id_base + 148:
+        process_id = int.from_bytes(data[id_base + 136 : id_base + 140], byteorder="big", signed=False)
+        if process_id:
+            metadata["process_id"] = str(process_id)
+
+        thread_id = int.from_bytes(data[id_base + 140 : id_base + 144], byteorder="big", signed=False)
+        if thread_id:
+            metadata["thread_id"] = str(thread_id)
+
+        trace_id = int.from_bytes(data[id_base + 144 : id_base + 148], byteorder="big", signed=False)
+        if trace_id:
+            metadata["trace_id"] = str(trace_id)
 
     product_id = decode_ebcdic_strip(data[id_base + 148 : id_base + 160])
     if product_id:
@@ -266,6 +455,20 @@ def extract_mq_metadata(data: bytes) -> Dict[str, str]:
     queue_manager_id = decode_ebcdic_strip(data[id_base + 160 : id_base + 208])
     if queue_manager_id:
         metadata["queue_manager_id"] = queue_manager_id
+
+    if len(data) >= id_base + 228:
+        pal_values = []
+        for offset in range(id_base + 208, id_base + 228, 2):
+            value = int.from_bytes(data[offset : offset + 2], byteorder="big", signed=False)
+            if value != 0xFFFF:
+                pal_values.append(str(value))
+        if pal_values:
+            metadata["pal"] = ",".join(pal_values)
+
+    if len(data) >= id_base + 240:
+        r_bytes = data[id_base + 228 : id_base + 240]
+        if any(byte != 0x00 for byte in r_bytes):
+            metadata["r_hex"] = r_bytes.hex()
 
     return metadata
 
@@ -287,7 +490,7 @@ def recv_all(sock: socket.socket) -> bytes:
     return b"".join(chunks)
 
 
-def print_parsed_metadata(metadata: Dict[str, str]) -> None:
+def print_parsed_metadata(metadata: Dict[str, str], debug: bool, show_flags: bool) -> None:
     print("    parsed:")
     if "header" in metadata:
         print(f"      - header: {metadata['header']}")
@@ -295,6 +498,18 @@ def print_parsed_metadata(metadata: Dict[str, str]) -> None:
         print(f"      - declared_length: {metadata['declared_length']}")
     if "tsh_ccsid" in metadata:
         print(f"      - tsh_ccsid: {metadata['tsh_ccsid']}")
+    if "fap_level" in metadata:
+        print(f"      - fap_level: {metadata['fap_level']}")
+    if "max_messages_per_batch" in metadata:
+        print(f"      - max_messages_per_batch: {metadata['max_messages_per_batch']}")
+    if "max_transmission_size" in metadata:
+        print(f"      - max_transmission_size: {metadata['max_transmission_size']}")
+    if "max_message_size" in metadata:
+        print(f"      - max_message_size: {metadata['max_message_size']}")
+    if "message_sequence_wrap_value" in metadata:
+        print(
+            f"      - message_sequence_wrap_value: {metadata['message_sequence_wrap_value']}"
+        )
     if "channel" in metadata:
         print(f"      - channel: {metadata['channel']}")
     if "queue_manager" in metadata:
@@ -303,6 +518,22 @@ def print_parsed_metadata(metadata: Dict[str, str]) -> None:
         print(f"      - ccsid: {metadata['ccsid']}")
     if "heartbeat_interval" in metadata:
         print(f"      - heartbeat_interval: {metadata['heartbeat_interval']}")
+    if "efl_length" in metadata:
+        print(f"      - efl_length: {metadata['efl_length']}")
+    if "header_compression" in metadata:
+        print(f"      - header_compression: {metadata['header_compression']}")
+    if "message_compression" in metadata:
+        print(f"      - message_compression: {metadata['message_compression']}")
+    if "ssl_key_reset" in metadata:
+        print(f"      - ssl_key_reset: {metadata['ssl_key_reset']}")
+    if "conversations_per_socket" in metadata:
+        print(f"      - conversations_per_socket: {metadata['conversations_per_socket']}")
+    if "process_id" in metadata:
+        print(f"      - process_id: {metadata['process_id']}")
+    if "thread_id" in metadata:
+        print(f"      - thread_id: {metadata['thread_id']}")
+    if "trace_id" in metadata:
+        print(f"      - trace_id: {metadata['trace_id']}")
     if "product_id" in metadata:
         print(f"      - product_id: {metadata['product_id']}")
     if "build_marker" in metadata:
@@ -313,9 +544,38 @@ def print_parsed_metadata(metadata: Dict[str, str]) -> None:
         print(f"      - build_id: {metadata['build_id']}")
     if "queue_manager_id" in metadata:
         print(f"      - queue_manager_id: {metadata['queue_manager_id']}")
+    if "pal" in metadata:
+        print(f"      - pal: {metadata['pal']}")
+    if show_flags:
+        print("      - flags:")
+        print(f"        id_flags: {metadata['id_flags']} ({metadata['id_flags_decoded']})")
+        print(f"        ide_flags: {metadata['ide_flags']} ({metadata['ide_flags_decoded']})")
+        print(f"        err_flags: {metadata['err_flags']} ({metadata['err_flags_decoded']})")
+        if "id_flags_2" in metadata:
+            print(
+                f"        id_flags_2: {metadata['id_flags_2']} ({metadata['id_flags_2_decoded']})"
+            )
+        if "ide_flags_2" in metadata:
+            print(
+                f"        ide_flags_2: {metadata['ide_flags_2']} ({metadata['ide_flags_2_decoded']})"
+            )
+        if "err_flags_2" in metadata:
+            print(f"        err_flags_2: {metadata['err_flags_2']}")
+        if "id_flags_3" in metadata:
+            print(
+                f"        id_flags_3: {metadata['id_flags_3']} ({metadata['id_flags_3_decoded']})"
+            )
+        if "ide_flags_3" in metadata:
+            print(
+                f"        ide_flags_3: {metadata['ide_flags_3']} ({metadata['ide_flags_3_decoded']})"
+            )
+    if debug and "r_hex" in metadata:
+        print(f"      - r_hex: {metadata['r_hex']}")
 
 
-def probe_port(host: str, port: int, debug: bool, socks_proxy: str | None) -> int:
+def probe_port(
+    host: str, port: int, debug: bool, socks_proxy: str | None, show_flags: bool
+) -> int:
     print(f"[+] Probing {host}:{port}")
     try:
         with open_socket(host, port, socks_proxy) as sock:
@@ -348,7 +608,7 @@ def probe_port(host: str, port: int, debug: bool, socks_proxy: str | None) -> in
 
     metadata = extract_mq_metadata(data)
     if metadata:
-        print_parsed_metadata(metadata)
+        print_parsed_metadata(metadata, debug, show_flags)
     else:
         print("    no MQ metadata parsed")
 
@@ -396,7 +656,7 @@ def main() -> int:
             print(f"invalid port: {port}", file=sys.stderr)
             return 2
         try:
-            rc |= probe_port(args.host, port, args.debug, args.socks)
+            rc |= probe_port(args.host, port, args.debug, args.socks, args.flags)
         except ValueError as exc:
             print(f"invalid SOCKS proxy: {exc}", file=sys.stderr)
             return 2
