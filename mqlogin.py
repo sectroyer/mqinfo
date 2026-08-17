@@ -10,7 +10,7 @@ import sys
 from dataclasses import dataclass
 
 
-SCRIPT_VERSION = "0.2.3"
+SCRIPT_VERSION = "0.2.4"
 BANNER_TITLE = "IBM MQ Login Tool"
 DEFAULT_CHANNEL = "SYSTEM.ADMIN.SVRCONN"
 DEFAULT_PORT = 1414
@@ -34,6 +34,7 @@ RFP_TST_MQCONN = 129
 RFP_TST_MQCONN_REPLY = 145
 RFP_TCF_FIRST = 0x10
 RFP_TCF_LAST = 0x20
+RFP_OPT_MQCONN = 0x01
 RFP_OPT_MQCONNX = 0x02
 RFP_CF_SPCAP_SUPPORTED = 0x01
 RFP_CF_ACCEPT_QM_HINTS = 0x04
@@ -82,6 +83,21 @@ RFP_ERR_CODES = {
     255: "COMMIT_INTERVAL",
 }
 
+MQRC_NAMES = {
+    0: "MQRC_NONE",
+    2009: "MQRC_CONNECTION_BROKEN",
+    2035: "MQRC_NOT_AUTHORIZED",
+    2059: "MQRC_Q_MGR_NOT_AVAILABLE",
+    2063: "MQRC_SECURITY_ERROR",
+    2195: "MQRC_UNEXPECTED_ERROR",
+    2278: "MQRC_CLIENT_CONN_ERROR",
+    2291: "MQRC_USER_ID_NOT_AVAILABLE",
+    2393: "MQRC_SSL_INITIALIZATION_ERROR",
+    2537: "MQRC_CHANNEL_NOT_AVAILABLE",
+    2538: "MQRC_HOST_NOT_AVAILABLE",
+    2594: "MQRC_PASSWORD_PROTECTION_ERROR",
+}
+
 
 class BannerArgumentParser(argparse.ArgumentParser):
     def format_help(self) -> str:
@@ -100,6 +116,24 @@ class RawLoginResult:
     fap_level: int | None = None
     stage: str | None = None
     error_text: str | None = None
+
+
+def format_mqrc(reason_code: int) -> str:
+    name = MQRC_NAMES.get(reason_code)
+    return f"{reason_code} ({name})" if name else str(reason_code)
+
+
+def authorization_summary(result: RawLoginResult) -> str:
+    if result.ok:
+        return "succeeded (MQRC_NONE): the queue manager accepted the connection"
+    if result.reason_code == 2035:
+        return (
+            "failed (MQRC_NOT_AUTHORIZED): the effective MQ identity is not permitted "
+            "to connect to this queue manager"
+        )
+    if result.reason_code is not None:
+        return f"not confirmed ({format_mqrc(result.reason_code)}): {result.error_text or 'MQCONN failed'}"
+    return f"not confirmed: {result.error_text or 'MQCONN did not complete'}"
 
 
 YFX = bytes(
@@ -630,28 +664,27 @@ def build_rfp_mqconn(qmgr: str, app_name: str, ccsid: int) -> bytes:
     payload = bytearray(120)
     payload[0:48] = encode_mq_field(qmgr, 48, ccsid)
     payload[48:76] = encode_mq_field(app_name, 28, ccsid)
-    write_u32(payload, 76, 0)
-    write_u32(payload, 112, RFP_OPT_MQCONNX)
+    write_u32(payload, 76, 28)
+    write_u32(payload, 112, RFP_OPT_MQCONN | RFP_OPT_MQCONNX)
     write_u32(payload, 116, 0)
     return bytes(payload)
 
 
-def build_mqapi_header(call_length: int) -> bytes:
+def build_mqapi_header(transmission_length: int) -> bytes:
     payload = bytearray(MQAPI_HEADER_SIZE)
-    write_u32(payload, 0, call_length)
+    # RfpMQAPI's call length includes the TSH and MQAPI headers.
+    write_u32(payload, 0, transmission_length)
     return bytes(payload)
 
 
-def build_mqconn_packet(host: str, port: int, qmgr: str, channel: str, user: str, password: str, ccsid: int) -> bytes:
-    connection_name = f"{host}({port})"
+def build_mqconn_packet(qmgr: str, fap_level: int, ccsid: int) -> bytes:
     app_name = "PYMQLOGIN"
-    mqcd = build_mqcd(connection_name, channel, ccsid)
-    mqcsp = build_mqcsp(user, password, ccsid)
-    mqcno = build_mqcno(mqcd, mqcsp)
     fap_mqcno = build_fap_mqcno()
     rfp_mqconn = build_rfp_mqconn(qmgr, app_name, ccsid)
-    call_body = rfp_mqconn + fap_mqcno + mqcno
-    mqapi = build_mqapi_header(len(call_body))
+    reconnection_data = bytes(72) if fap_level >= 10 else b""
+    call_body = rfp_mqconn + fap_mqcno + reconnection_data
+    transmission_length = TSH_HEADER_SIZE + MQAPI_HEADER_SIZE + len(call_body)
+    mqapi = build_mqapi_header(transmission_length)
     tsh = build_tsh(RFP_TST_MQCONN, len(mqapi) + len(call_body), RFP_TCF_FIRST | RFP_TCF_LAST, ccsid)
     return tsh + mqapi + call_body
 
@@ -924,9 +957,7 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
             )
 
         stage = "mqconn-send"
-        mqconn_packet = build_mqconn_packet(
-            args.host, args.port, args.qmgr, args.channel, args.user, password, active_ccsid
-        )
+        mqconn_packet = build_mqconn_packet(args.qmgr, fap_level or RFP_FAP_LEVEL, active_ccsid)
         debug_tsh(args, "tx", stage, mqconn_packet)
         sock.sendall(mqconn_packet)
         stage = "mqconn-recv"
@@ -1002,6 +1033,7 @@ def connect_and_report(args: argparse.Namespace) -> int:
 
     if result.ok:
         print("    login: success")
+        print(f"    authorization: {authorization_summary(result)}")
         if result.queue_manager:
             print(f"    connected queue manager: {result.queue_manager}")
         if result.channel:
@@ -1015,13 +1047,14 @@ def connect_and_report(args: argparse.Namespace) -> int:
     if result.comp_code is not None:
         print(f"    mqcc: {result.comp_code}")
     if result.reason_code is not None:
-        print(f"    mqrc: {result.reason_code}")
+        print(f"    mqrc: {format_mqrc(result.reason_code)}")
     if result.fap_level is not None:
         print(f"    fap_level: {result.fap_level}")
     if result.stage:
         print(f"    stage: {result.stage}")
     if result.error_text:
         print(f"    error: {result.error_text}")
+    print(f"    authorization: {authorization_summary(result)}")
     print()
     return 1
 
