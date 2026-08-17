@@ -9,7 +9,7 @@ It connects to the target, checks the standard IBM MQ listener ports by default,
 - Checks the default IBM MQ TCP ports `1414` through `1419`
 - Accepts `-p` / `--port` to probe a single port
 - Accepts `-d` / `--debug` to print raw response data and extracted strings
-- Parses common IBM MQ response fields such as channel and queue manager
+- Parses common IBM MQ response fields such as channel, queue manager, version, and build marker
 - Shows built-in help with the tool banner when run without arguments
 
 ## Requirements
@@ -57,6 +57,9 @@ Typical parsed fields:
 - `declared_length`: Response length declared in the MQ packet
 - `channel`: Listener channel name returned by the target
 - `queue_manager`: Queue manager identifier parsed from the response
+- `build_marker`: Raw IBM MQ build/version marker, shown as an anonymized placeholder in examples
+- `version`: Parsed MQ version
+- `build_id`: Build token extracted from the build marker
 
 Example:
 
@@ -70,6 +73,9 @@ IBM MQ Info Tool v0.2.2
       - declared_length: 236
       - channel: <channel-name>
       - queue_manager: <queue-manager>
+      - build_marker: MQMV<version><queue-manager>.<build-id>
+      - version: <mq-version>
+      - build_id: <build-id>
 ```
 
 Debug mode additionally prints:
