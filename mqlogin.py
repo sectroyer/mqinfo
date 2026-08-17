@@ -25,6 +25,9 @@ MQCSP_VERSION_1 = 1
 MQCSP_AUTH_USER_ID_AND_PWD = 1
 RFP_FAP_LEVEL = 17
 RFP_TST_INITIAL_INFO = 1
+RFP_TST_STATUS_INFO = 5
+RFP_TST_USERID_DATA = 8
+RFP_TST_CONAUTH_INFO = 10
 RFP_TST_MQCONN = 129
 RFP_TST_MQCONN_REPLY = 145
 RFP_TCF_FIRST = 0x10
@@ -93,7 +96,57 @@ class RawLoginResult:
     queue_manager: str | None = None
     channel: str | None = None
     fap_level: int | None = None
+    stage: str | None = None
     error_text: str | None = None
+
+
+YFX = bytes(
+    [
+        0xDF,
+        0x09,
+        0x15,
+        0x84,
+        0x89,
+        0x7B,
+        0x7E,
+        0xD6,
+        0xB7,
+        0x32,
+        0xC1,
+        0x17,
+        0xB5,
+        0xF8,
+        0xAB,
+        0xB8,
+        0xD5,
+        0x41,
+        0xE3,
+        0x1B,
+        0xDB,
+        0x54,
+        0xAA,
+        0x62,
+    ]
+)
+PC_1C = [57, 49, 41, 33, 25, 17, 9, 1, 58, 50, 42, 34, 26, 18, 10, 2, 59, 51, 43, 35, 27, 19, 11, 3, 60, 52, 44, 36]
+PC_1D = [62, 55, 47, 39, 31, 23, 15, 7, 62, 54, 46, 38, 30, 22, 14, 6, 61, 53, 45, 37, 29, 21, 13, 5, 28, 20, 12, 4]
+PC_2C = [14, 17, 11, 24, 1, 5, 3, 28, 15, 6, 21, 10, 23, 19, 12, 4, 26, 8, 16, 7, 27, 20, 13, 2]
+PC_2D = [41, 52, 31, 37, 47, 55, 30, 40, 51, 45, 33, 48, 44, 49, 39, 56, 34, 53, 46, 42, 50, 36, 29, 32]
+SHIFTS = [1, 1, 2, 2, 2, 2, 2, 2, 1, 2, 2, 2, 2, 2, 2, 1]
+E_TABLE = [32, 1, 2, 3, 4, 5, 4, 5, 6, 7, 8, 9, 8, 9, 10, 11, 12, 13, 12, 13, 14, 15, 16, 17, 16, 17, 18, 19, 20, 21, 20, 21, 22, 23, 24, 25, 24, 25, 26, 27, 28, 29, 28, 29, 30, 31, 32, 1]
+P_TABLE = [16, 7, 20, 21, 29, 12, 28, 17, 1, 15, 23, 26, 5, 18, 31, 10, 2, 8, 24, 14, 32, 27, 3, 9, 19, 13, 30, 6, 22, 11, 4, 25]
+IP_TABLE = [58, 50, 42, 34, 26, 18, 10, 2, 60, 52, 44, 36, 28, 20, 12, 4, 62, 54, 46, 38, 30, 22, 14, 6, 64, 56, 48, 40, 32, 24, 16, 8, 57, 49, 41, 33, 25, 17, 9, 1, 59, 51, 43, 35, 27, 19, 11, 3, 61, 53, 45, 37, 29, 21, 13, 5, 63, 55, 47, 39, 31, 23, 15, 7]
+IP_INV_TABLE = [40, 8, 48, 16, 56, 24, 64, 32, 39, 7, 47, 15, 55, 23, 63, 31, 38, 6, 46, 14, 54, 22, 62, 30, 37, 5, 45, 13, 53, 21, 61, 29, 36, 4, 44, 12, 52, 20, 60, 28, 35, 3, 43, 11, 51, 19, 59, 27, 34, 2, 42, 10, 50, 18, 58, 26, 33, 1, 41, 9, 49, 17, 57, 25]
+S_BOXES = [
+    [[14, 4, 13, 1, 2, 15, 11, 8, 3, 10, 6, 12, 5, 9, 0, 7], [0, 15, 7, 4, 14, 2, 13, 1, 10, 6, 12, 11, 9, 5, 3, 8], [4, 1, 14, 8, 13, 6, 2, 11, 15, 12, 9, 7, 3, 10, 5, 0], [15, 12, 8, 2, 4, 9, 1, 7, 5, 11, 3, 14, 10, 0, 6, 13]],
+    [[15, 1, 8, 14, 6, 11, 3, 4, 9, 7, 2, 13, 12, 0, 5, 10], [3, 13, 4, 7, 15, 2, 8, 14, 12, 0, 1, 10, 6, 9, 11, 5], [0, 14, 7, 11, 10, 4, 13, 1, 5, 8, 12, 6, 9, 3, 2, 15], [13, 8, 10, 1, 3, 15, 4, 2, 11, 6, 7, 12, 0, 5, 14, 9]],
+    [[10, 0, 9, 14, 6, 3, 15, 5, 1, 13, 12, 7, 11, 4, 2, 8], [13, 7, 0, 9, 3, 4, 6, 10, 2, 8, 5, 14, 12, 11, 15, 1], [13, 6, 4, 9, 8, 15, 3, 0, 11, 1, 2, 12, 5, 10, 14, 7], [1, 10, 13, 0, 6, 9, 8, 7, 4, 15, 14, 3, 11, 5, 2, 12]],
+    [[7, 13, 14, 3, 0, 6, 9, 10, 1, 2, 8, 5, 11, 12, 4, 15], [13, 8, 11, 5, 6, 15, 0, 3, 4, 7, 2, 12, 1, 10, 14, 9], [10, 6, 9, 0, 12, 11, 7, 13, 15, 1, 3, 14, 5, 2, 8, 4], [3, 15, 0, 6, 10, 1, 13, 8, 9, 4, 5, 11, 12, 7, 2, 14]],
+    [[2, 12, 4, 1, 7, 10, 11, 6, 8, 5, 3, 15, 13, 0, 14, 9], [14, 11, 2, 12, 4, 7, 13, 1, 5, 0, 15, 10, 3, 9, 8, 6], [4, 2, 1, 11, 10, 13, 7, 8, 15, 9, 12, 5, 6, 3, 0, 14], [11, 8, 12, 7, 1, 14, 2, 13, 6, 15, 0, 9, 10, 4, 5, 3]],
+    [[12, 1, 10, 15, 9, 2, 6, 8, 0, 13, 3, 4, 14, 7, 5, 11], [10, 15, 4, 2, 7, 12, 9, 5, 6, 1, 13, 14, 0, 11, 3, 8], [9, 14, 15, 5, 2, 8, 12, 3, 7, 0, 4, 10, 1, 13, 11, 6], [4, 3, 2, 12, 9, 5, 15, 10, 11, 14, 1, 7, 6, 0, 8, 13]],
+    [[4, 11, 2, 14, 15, 0, 8, 13, 3, 12, 9, 7, 5, 10, 6, 1], [13, 0, 11, 7, 4, 9, 1, 10, 14, 3, 5, 12, 2, 15, 8, 6], [1, 4, 11, 13, 12, 3, 7, 14, 10, 15, 6, 8, 0, 5, 9, 2], [6, 11, 13, 8, 1, 4, 10, 7, 9, 5, 0, 15, 14, 2, 3, 12]],
+    [[13, 2, 8, 4, 6, 15, 11, 1, 10, 9, 3, 14, 5, 0, 12, 7], [1, 15, 13, 8, 10, 3, 7, 4, 12, 5, 6, 11, 0, 14, 9, 2], [7, 11, 4, 1, 9, 12, 14, 2, 0, 6, 10, 13, 15, 3, 5, 8], [2, 1, 14, 7, 4, 10, 8, 13, 15, 12, 9, 0, 3, 5, 6, 11]],
+]
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -312,6 +365,124 @@ def write_u32(buffer: bytearray, offset: int, value: int) -> None:
     buffer[offset : offset + 4] = value.to_bytes(4, "big", signed=False)
 
 
+def write_u32_native(buffer: bytearray, offset: int, value: int) -> None:
+    """Write RFP structure integers as IBM's Java client does on x86 hosts."""
+    buffer[offset : offset + 4] = value.to_bytes(4, "little", signed=False)
+
+
+def read_u32(buffer: bytes | bytearray, offset: int) -> int:
+    return int.from_bytes(buffer[offset : offset + 4], "big", signed=False)
+
+
+def read_u32_native(buffer: bytes | bytearray, offset: int) -> int:
+    return int.from_bytes(buffer[offset : offset + 4], "little", signed=False)
+
+
+def _bytes_to_bits(byte_data: bytes) -> list[int]:
+    bits = [0] * (len(byte_data) * 8)
+    for i, curr_byte in enumerate(byte_data):
+        for j in range(8):
+            bits[i * 8 + j] = (curr_byte >> (7 - j)) & 1
+    return bits
+
+
+def _bits_to_bytes(bit_data: list[int]) -> bytes:
+    out = bytearray(len(bit_data) // 8)
+    for i in range(len(out)):
+        j = i * 8
+        out[i] = (
+            (bit_data[j] << 7)
+            | (bit_data[j + 1] << 6)
+            | (bit_data[j + 2] << 5)
+            | (bit_data[j + 3] << 4)
+            | (bit_data[j + 4] << 3)
+            | (bit_data[j + 5] << 2)
+            | (bit_data[j + 6] << 1)
+            | bit_data[j + 7]
+        )
+    return bytes(out)
+
+
+def _key_schedule(key: bytes) -> list[list[int]]:
+    bit_key = _bytes_to_bits(key)
+    c = [bit_key[index - 1] for index in PC_1C]
+    d = [bit_key[index - 1] for index in PC_1D]
+    schedules: list[list[int]] = []
+    for shift in SHIFTS:
+        c = c[shift:] + c[:shift]
+        d = d[shift:] + d[:shift]
+        ks = [0] * 48
+        for j in range(24):
+            ks[j] = c[PC_2C[j] - 1]
+            ks[j + 24] = d[PC_2D[j] - 29]
+        schedules.append(ks)
+    return schedules
+
+
+def _des_f(right: list[int], key_bits: list[int]) -> list[int]:
+    input_s = [right[index - 1] ^ key_bits[i] for i, index in enumerate(E_TABLE)]
+    output_s = [0] * 32
+    for i in range(8):
+        j = i * 6
+        row = input_s[j] * 2 + input_s[j + 5]
+        col = input_s[j + 1] * 8 + input_s[j + 2] * 4 + input_s[j + 3] * 2 + input_s[j + 4]
+        val = S_BOXES[i][row][col]
+        k = i * 4
+        output_s[k] = (val >> 3) & 1
+        output_s[k + 1] = (val >> 2) & 1
+        output_s[k + 2] = (val >> 1) & 1
+        output_s[k + 3] = val & 1
+    return [output_s[index - 1] for index in P_TABLE]
+
+
+def _des_encrypt_block(key: bytes, block: bytes) -> bytes:
+    ks = _key_schedule(key)
+    tmp = [_bytes_to_bits(block)[index - 1] for index in IP_TABLE]
+    for round_index in range(16):
+        left = tmp[:32]
+        right = tmp[32:]
+        f_out = _des_f(right, ks[round_index])
+        if round_index < 15:
+            tmp = right + [left[i] ^ f_out[i] for i in range(32)]
+        else:
+            tmp = [left[i] ^ f_out[i] for i in range(32)] + right
+    output_bits = [tmp[index - 1] for index in IP_INV_TABLE]
+    return _bits_to_bytes(output_bits)
+
+
+def remote_ppa_finish_auth_flow(buffer: bytearray, length_offset: int, password_offset: int, r_state: bytes, ppa: int) -> int:
+    password_length = read_u32_native(buffer, length_offset)
+    if ppa == 0:
+        return password_length
+    if password_length == 0:
+        return password_length
+    if ppa != 1:
+        return -1
+    padded_length = password_length
+    if padded_length % 8 != 0:
+        padded_length += 8 - (padded_length % 8)
+    working = bytearray(padded_length)
+    working[:password_length] = buffer[password_offset : password_offset + password_length]
+    ra = r_state[0:8]
+    rb = r_state[8:16]
+    rc = r_state[16:24]
+    keys: list[bytes] = []
+    for base, r_part in ((0, ra), (8, rb), (16, rc)):
+        key = bytearray(8)
+        for index in range(8):
+            key[index] = YFX[base + index] ^ 0x08
+            if index == 0:
+                key[index] = (key[index] & 0xF0) | ((key[index] ^ r_part[index]) & 0x0F)
+            else:
+                key[index] ^= r_part[index]
+        keys.append(bytes(key))
+    for key in keys:
+        for block in range(0, padded_length, 8):
+            working[block : block + 8] = _des_encrypt_block(key, bytes(working[block : block + 8]))
+    buffer[password_offset : password_offset + padded_length] = working
+    return padded_length
+
+
 def build_tsh(segment_type: int, payload_length: int, control_flags1: int) -> bytes:
     tsh = bytearray(TSH_HEADER_SIZE)
     tsh[0:4] = b"TSH "
@@ -325,20 +496,21 @@ def build_tsh(segment_type: int, payload_length: int, control_flags1: int) -> by
     return bytes(tsh)
 
 
-def build_initial_id_packet(channel: str, qmgr: str) -> bytes:
+def build_initial_id_packet(channel: str, qmgr: str, client_r: bytes) -> bytes:
     payload = bytearray(240)
-    payload[0:4] = encode_mq_field("ID  ", 4)
+    # RfpID uses a literal ASCII eyecatcher, unlike the MQ character fields.
+    payload[0:4] = b"ID  "
     payload[4] = RFP_FAP_LEVEL
-    payload[5] = 0x7F
-    payload[6] = 0xF6
-    payload[7] = 0x06
+    payload[5] = 0x22  # conversion capable + MQ request
+    payload[6] = 0
+    payload[7] = 0
     payload[10:12] = (10).to_bytes(2, "big")
     write_u32(payload, 12, 0x400)
     write_u32(payload, 16, 0)
     write_u32(payload, 20, 0)
     payload[24:44] = encode_mq_field(channel, 20)
-    payload[44] = 0x00
-    payload[45] = 0x6A
+    payload[44] = 0x51
+    payload[45] = 0
     payload[46:48] = (1208).to_bytes(2, "big")
     payload[48:96] = encode_mq_field(qmgr, 48)
     write_u32(payload, 96, 300)
@@ -347,13 +519,18 @@ def build_initial_id_packet(channel: str, qmgr: str) -> bytes:
     payload[104:106] = b"\x00\xFF"
     payload[106:122] = b"\xFF" * 16
     write_u32(payload, 128, 1)
-    payload[132] = 0x10
-    payload[133] = 0x20
+    payload[132] = 0x28
+    payload[133] = 0
     payload[148:160] = encode_mq_field("MQJB00000000", 12)
     payload[160:208] = encode_mq_field("PYMQLOGIN", 48)
-    for offset in range(208, 228, 2):
+    # Offer no protection and DES. The queue manager selects DES when its
+    # CONNAUTH policy requires protected passwords.
+    payload[208:210] = (0).to_bytes(2, "big")
+    payload[210:212] = (1).to_bytes(2, "big")
+    for offset in range(212, 228, 2):
         payload[offset : offset + 2] = (0xFFFF).to_bytes(2, "big")
-    tsh = build_tsh(RFP_TST_INITIAL_INFO, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST)
+    payload[228:240] = client_r
+    tsh = build_tsh(RFP_TST_INITIAL_INFO, len(payload), 0x01 | RFP_TCF_FIRST | RFP_TCF_LAST)
     return tsh + payload
 
 
@@ -441,6 +618,47 @@ def build_mqconn_packet(host: str, port: int, qmgr: str, channel: str, user: str
     return tsh + mqapi + call_body
 
 
+def build_uid_packet(user: str, fap_level: int) -> bytes:
+    payload_size = 28 if fap_level < 5 else 132
+    payload = bytearray(payload_size)
+    payload[0:4] = b"UID "
+    short_user = user.upper()[:12]
+    payload[4:16] = encode_ascii_field(short_user, 12)
+    payload[16:28] = encode_ascii_field("", 12)
+    if fap_level >= 5:
+        payload[28:92] = encode_ascii_field(user, 64)
+    tsh = build_tsh(RFP_TST_USERID_DATA, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST)
+    return tsh + payload
+
+
+def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_state: bytes) -> bytes:
+    user_bytes = user.encode("ascii", errors="ignore")
+    password_bytes = password.encode("ascii", errors="ignore")
+    user_id_offset = 32 if fap_level > 16 else 24
+    payload = bytearray(user_id_offset + len(user_bytes) + len(password_bytes))
+    payload[0:4] = b"CAUT"
+    # RfpCAUT uses JmqiDC.writeI32(..., this.swap). On the supported Java
+    # client platforms that is little-endian; network-order values make the
+    # queue manager interpret these lengths as invalidly large.
+    write_u32_native(payload, 4, MQCSP_AUTH_USER_ID_AND_PWD)
+    write_u32_native(payload, 8, len(user_bytes))
+    write_u32_native(payload, 12, len(password_bytes))
+    write_u32_native(payload, 16, len(user_bytes))
+    write_u32_native(payload, 20, len(password_bytes))
+    if fap_level > 16:
+        write_u32_native(payload, 24, 0)
+        write_u32_native(payload, 28, 0)
+    payload[user_id_offset : user_id_offset + len(user_bytes)] = user_bytes
+    password_offset = user_id_offset + len(user_bytes)
+    payload[password_offset : password_offset + len(password_bytes)] = password_bytes
+    new_password_len = remote_ppa_finish_auth_flow(payload, 20, password_offset, r_state, ppa)
+    if new_password_len < 0:
+        raise ValueError(f"unsupported MQ password protection algorithm: {ppa}")
+    write_u32_native(payload, 20, new_password_len)
+    tsh = build_tsh(RFP_TST_CONAUTH_INFO, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST)
+    return tsh + payload
+
+
 def recv_tsh_packet(sock: socket.socket) -> bytes:
     header = recv_exact(sock, TSH_HEADER_SIZE)
     declared_length = int.from_bytes(header[4:8], "big", signed=False)
@@ -450,15 +668,19 @@ def recv_tsh_packet(sock: socket.socket) -> bytes:
     return header + body
 
 
-def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None, int | None]:
+def parse_id_response(packet: bytes) -> tuple[int | None, str | None, str | None, int | None, int | None, bytes]:
     if len(packet) < TSH_HEADER_SIZE + 104:
-        return None, None, None, None
+        return None, None, None, None, None, b""
     base = TSH_HEADER_SIZE
     fap_level = packet[base + 4]
     err = packet[base + 7]
     channel = decode_ebcdic_strip(packet[base + 24 : base + 44]) or None
     queue_manager = decode_ebcdic_strip(packet[base + 48 : base + 96]) or None
-    return err, channel, queue_manager, fap_level
+    ppa = None
+    if len(packet) >= base + 210:
+        ppa = int.from_bytes(packet[base + 208 : base + 210], "big", signed=False)
+    server_r = packet[base + 228 : base + 240] if len(packet) >= base + 240 else b""
+    return err, channel, queue_manager, fap_level, ppa, server_r
 
 
 def parse_mqconn_reply(packet: bytes) -> RawLoginResult:
@@ -481,31 +703,88 @@ def parse_mqconn_reply(packet: bytes) -> RawLoginResult:
     )
 
 
+def parse_status_packet(packet: bytes) -> tuple[bool, str | None]:
+    if len(packet) < TSH_HEADER_SIZE:
+        return False, "short status reply"
+    segment_type = packet[9]
+    control_flags1 = packet[10]
+    if segment_type != RFP_TST_STATUS_INFO:
+        return False, f"unexpected reply segment type {segment_type}"
+    if control_flags1 & 0x02:
+        return False, "server returned error status flow"
+    return True, None
+
+
 def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
+    stage = "connect"
     sock = open_socket(args.host, args.port, args.socks, args.timeout)
     try:
         sock.settimeout(READ_TIMEOUT)
-        sock.sendall(build_initial_id_packet(args.channel, args.qmgr))
+        stage = "id"
+        client_r = os.urandom(12)
+        sock.sendall(build_initial_id_packet(args.channel, args.qmgr, client_r))
         id_reply = recv_tsh_packet(sock)
-        err_flag, channel, queue_manager, fap_level = parse_id_response(id_reply)
+        err_flag, channel, queue_manager, fap_level, ppa, server_r = parse_id_response(id_reply)
         if err_flag not in (None, 0):
             return RawLoginResult(
                 ok=False,
                 queue_manager=queue_manager,
                 channel=channel,
                 fap_level=fap_level,
+                stage=stage,
                 error_text=f"listener rejected initial ID with {RFP_ERR_CODES.get(err_flag, err_flag)}",
             )
+        # Older/shorter ID replies do not include PAL/R. IBM's client treats
+        # that as the legacy, unprotected-password negotiation.
+        if ppa is not None and ppa not in (0, 1):
+            return RawLoginResult(
+                ok=False,
+                queue_manager=queue_manager,
+                channel=channel,
+                fap_level=fap_level,
+                stage=stage,
+                error_text=f"queue manager selected unsupported password protection algorithm: {ppa}",
+            )
+        if ppa == 1 and len(server_r) != 12:
+            return RawLoginResult(
+                ok=False,
+                queue_manager=queue_manager,
+                channel=channel,
+                fap_level=fap_level,
+                stage=stage,
+                error_text="queue manager selected DES password protection without an R value",
+            )
 
+        stage = "uid"
+        uid_user = getpass.getuser()
+        sock.sendall(build_uid_packet(uid_user, fap_level or RFP_FAP_LEVEL))
+
+        stage = "caut"
+        r_state = client_r + server_r
+        sock.sendall(build_caut_packet(args.user, password, fap_level or RFP_FAP_LEVEL, ppa or 0, r_state))
+        caut_reply = recv_tsh_packet(sock)
+        caut_ok, caut_error = parse_status_packet(caut_reply)
+        if not caut_ok:
+            return RawLoginResult(
+                ok=False,
+                queue_manager=queue_manager,
+                channel=channel,
+                fap_level=fap_level,
+                stage=stage,
+                error_text=caut_error,
+            )
+
+        stage = "mqconn"
         sock.sendall(build_mqconn_packet(args.host, args.port, args.qmgr, args.channel, args.user, password))
         conn_reply = recv_tsh_packet(sock)
         result = parse_mqconn_reply(conn_reply)
         result.queue_manager = queue_manager
         result.channel = channel
         result.fap_level = fap_level
+        result.stage = stage
         return result
     except Exception as exc:
-        return RawLoginResult(ok=False, error_text=str(exc))
+        return RawLoginResult(ok=False, stage=stage, error_text=str(exc))
     finally:
         sock.close()
 
@@ -584,6 +863,8 @@ def connect_and_report(args: argparse.Namespace) -> int:
         print(f"    mqrc: {result.reason_code}")
     if result.fap_level is not None:
         print(f"    fap_level: {result.fap_level}")
+    if result.stage:
+        print(f"    stage: {result.stage}")
     if result.error_text:
         print(f"    error: {result.error_text}")
     print()
