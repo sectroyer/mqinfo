@@ -54,6 +54,7 @@ MQCO_NONE = 0
 MQOT_Q = 1
 MQOT_Q_MGR = 5
 MQGMO_BROWSE_FIRST = 0x00000010
+MQGMO_BROWSE_NEXT = 0x00000020
 MQGMO_ACCEPT_TRUNCATED_MSG = 0x00000040
 MQMD_V1_SIZE = 324
 MQGMO_V1_SIZE = 72
@@ -273,7 +274,12 @@ def inquire(session_sock: object, handle: int, selectors: list[int], char_attr_l
         required = offset + int_count * 4 + char_attr_length
         if len(reply) < required:
             return MqiInquireResult(comp_code, reason_code, error_text="truncated MQINQ reply")
-        int_attributes = [mqlogin.read_u32_ordered(reply, offset + 4 * index, swap) for index in range(int_count)]
+        # MQI integer attributes are signed MQLONG values.  In particular, MQ
+        # uses -1 (0xffffffff on the wire) for values that are not applicable.
+        int_attributes = []
+        for index in range(int_count):
+            value = mqlogin.read_u32_ordered(reply, offset + 4 * index, swap)
+            int_attributes.append(value - 0x100000000 if value >= 0x80000000 else value)
         char_offset = offset + int_count * 4
         return MqiInquireResult(comp_code, reason_code, int_attributes, reply[char_offset : char_offset + char_attr_length])
     except Exception as exc:
@@ -408,7 +414,9 @@ def inquire_queue(session_sock: object, object_name: str, swap: bool, ccsid: int
             pass
 
 
-def build_mqget_browse_packet(handle: int, max_bytes: int, swap: bool, ccsid: int) -> bytes:
+def build_mqget_browse_packet(
+    handle: int, max_bytes: int, swap: bool, ccsid: int, browse_option: int = MQGMO_BROWSE_FIRST
+) -> bytes:
     if not 1 <= max_bytes <= 1024 * 1024:
         raise ValueError("browse byte limit must be between 1 and 1048576")
     md = bytearray(MQMD_V1_SIZE)
@@ -417,15 +425,19 @@ def build_mqget_browse_packet(handle: int, max_bytes: int, swap: bool, ccsid: in
     gmo = bytearray(MQGMO_V1_SIZE)
     gmo[0:4] = mqlogin.encode_mq_bytes("GMO ", ccsid)
     mqlogin.write_u32_ordered(gmo, 4, 1, swap)
-    mqlogin.write_u32_ordered(gmo, 8, MQGMO_BROWSE_FIRST | MQGMO_ACCEPT_TRUNCATED_MSG, swap)
+    if browse_option not in (MQGMO_BROWSE_FIRST, MQGMO_BROWSE_NEXT):
+        raise ValueError("invalid non-destructive browse option")
+    mqlogin.write_u32_ordered(gmo, 8, browse_option | MQGMO_ACCEPT_TRUNCATED_MSG, swap)
     body = md + gmo + max_bytes.to_bytes(4, "little" if swap else "big")
     return _build_mqi_packet(RFP_TST_MQGET, handle, body, swap, ccsid, max_bytes)
 
 
-def browse_first_message(session_sock: object, handle: int, max_bytes: int, swap: bool, ccsid: int) -> BrowseResult:
-    """Browse, never consume, at most ``max_bytes`` of the first message."""
+def browse_message(
+    session_sock: object, handle: int, max_bytes: int, swap: bool, ccsid: int, browse_option: int
+) -> BrowseResult:
+    """Browse, never consume, at most ``max_bytes`` from the current cursor position."""
     try:
-        session_sock.sendall(build_mqget_browse_packet(handle, max_bytes, swap, ccsid))
+        session_sock.sendall(build_mqget_browse_packet(handle, max_bytes, swap, ccsid, browse_option))
         reply = mqlogin.recv_tsh_packet(session_sock)
         comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQGET_REPLY, swap)
         if comp_code == 2:
@@ -459,7 +471,40 @@ def browse_queue(
     if handle is None:
         return BrowseResult(open_result.comp_code, open_result.reason_code, error_text=open_result.error_text)
     try:
-        return browse_first_message(session_sock, handle, max_bytes, swap, ccsid)
+        return browse_message(session_sock, handle, max_bytes, swap, ccsid, MQGMO_BROWSE_FIRST)
+    finally:
+        try:
+            close_object(session_sock, handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
+
+
+def browse_queue_messages(
+    session_sock: object, object_name: str, max_bytes: int, count: int, swap: bool, ccsid: int, fap_level: int
+) -> list[BrowseResult]:
+    """Browse up to ``count`` messages using BROWSE_FIRST then BROWSE_NEXT."""
+    if count < 1:
+        raise ValueError("browse count must be at least 1")
+    handle, open_result = open_for_inquire(
+        session_sock, object_name, MQOT_Q, swap, ccsid, fap_level, MQOO_INQUIRE | MQOO_BROWSE
+    )
+    if handle is None:
+        return [BrowseResult(open_result.comp_code, open_result.reason_code, error_text=open_result.error_text)]
+    results: list[BrowseResult] = []
+    try:
+        for index in range(count):
+            result = browse_message(
+                session_sock, handle, max_bytes, swap, ccsid,
+                MQGMO_BROWSE_FIRST if index == 0 else MQGMO_BROWSE_NEXT,
+            )
+            if result.reason_code == 2033:
+                if not results:
+                    results.append(result)
+                break
+            results.append(result)
+            if result.error_text or result.comp_code == 2:
+                break
+        return results
     finally:
         try:
             close_object(session_sock, handle, swap, ccsid)
