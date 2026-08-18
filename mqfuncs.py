@@ -57,6 +57,9 @@ MQIA_COMMAND_LEVEL = 31
 MQIA_PLATFORM = 32
 MQCA_Q_MGR_NAME = 2015
 MQIA_CURRENT_Q_DEPTH = 3
+MQIA_DEF_PERSISTENCE = 5
+MQIA_INHIBIT_GET = 9
+MQIA_INHIBIT_PUT = 10
 MQIA_MAX_Q_DEPTH = 15
 MQIA_Q_TYPE = 20
 MQCA_Q_NAME = 2016
@@ -82,6 +85,17 @@ MQ_PLATFORM_NAMES = {
     27: "z/VSE",
     28: "IBM MQ Appliance",
 }
+MQ_CCSID_NAMES = {
+    37: "EBCDIC US/Canada",
+    500: "EBCDIC International",
+    819: "ISO-8859-1 (Latin-1)",
+    870: "EBCDIC Multilingual Latin-2",
+    1200: "UTF-16",
+    1208: "UTF-8",
+}
+MQ_QUEUE_TYPE_NAMES = {1: "local", 2: "model", 3: "alias", 6: "remote"}
+MQ_PERSISTENCE_NAMES = {0: "not persistent", 1: "persistent", 2: "as queue default"}
+MQ_INHIBIT_NAMES = {0: "allowed", 1: "inhibited"}
 
 
 class BannerArgumentParser(argparse.ArgumentParser):
@@ -147,6 +161,40 @@ def format_spi_verb(verb: SpiVerb) -> str:
 
 def format_mq_platform(platform: int) -> str:
     return f"{platform} ({MQ_PLATFORM_NAMES.get(platform, 'unknown platform')})"
+
+
+def format_mq_ccsid(ccsid: int) -> str:
+    return f"{ccsid} ({MQ_CCSID_NAMES.get(ccsid, 'unknown CCSID')})"
+
+
+def format_command_level(command_level: int) -> str:
+    if 900 <= command_level <= 999:
+        return f"{command_level} (IBM MQ {command_level // 100}.{(command_level // 10) % 10}.{command_level % 10})"
+    return str(command_level)
+
+
+def format_queue_attribute(name: str, value: int | str) -> int | str:
+    if not isinstance(value, int):
+        return value
+    if name == "queue_type":
+        return f"{value} ({MQ_QUEUE_TYPE_NAMES.get(value, 'unknown type')})"
+    if name == "default_persistence":
+        return f"{value} ({MQ_PERSISTENCE_NAMES.get(value, 'unknown persistence')})"
+    if name in ("get", "put"):
+        return f"{value} ({MQ_INHIBIT_NAMES.get(value, 'unknown state')})"
+    return value
+
+
+def format_queue_manager_attribute(name: str, value: int | str) -> int | str:
+    if name == "coded_char_set_id" and isinstance(value, int):
+        return format_mq_ccsid(value)
+    if name == "command_level" and isinstance(value, int):
+        return format_command_level(value)
+    if name == "platform" and isinstance(value, int):
+        return format_mq_platform(value)
+    if name == "max_message_length" and value == 0:
+        return "0 (not reported)"
+    return value
 
 
 def _build_mqi_packet(
@@ -305,7 +353,15 @@ def inquire_queue(session_sock: object, object_name: str, swap: bool, ccsid: int
     if handle is None:
         return {}, open_result
     try:
-        selectors = [MQIA_CURRENT_Q_DEPTH, MQIA_MAX_Q_DEPTH, MQIA_Q_TYPE, MQCA_Q_NAME]
+        selectors = [
+            MQIA_CURRENT_Q_DEPTH,
+            MQIA_MAX_Q_DEPTH,
+            MQIA_Q_TYPE,
+            MQIA_DEF_PERSISTENCE,
+            MQIA_INHIBIT_GET,
+            MQIA_INHIBIT_PUT,
+            MQCA_Q_NAME,
+        ]
         result = inquire(session_sock, handle, selectors, 48, swap, ccsid)
         if result.error_text or result.comp_code == 2 or result.int_attributes is None:
             return {}, result
@@ -313,6 +369,9 @@ def inquire_queue(session_sock: object, object_name: str, swap: bool, ccsid: int
             "current_depth": result.int_attributes[0],
             "max_depth": result.int_attributes[1],
             "queue_type": result.int_attributes[2],
+            "default_persistence": result.int_attributes[3],
+            "get": result.int_attributes[4],
+            "put": result.int_attributes[5],
             "queue_name": mqlogin.decode_mq_field(result.char_attributes, ccsid),
         }, result
     finally:
