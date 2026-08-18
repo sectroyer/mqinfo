@@ -67,6 +67,21 @@ QMGR_INFO_SELECTORS = (
     ("command_level", MQIA_COMMAND_LEVEL),
     ("platform", MQIA_PLATFORM),
 )
+MQ_PLATFORM_NAMES = {
+    1: "z/OS (MVS/OS390)",
+    2: "OS/2",
+    3: "AIX/UNIX",
+    4: "IBM i (OS/400)",
+    5: "Windows",
+    11: "Windows NT",
+    12: "OpenVMS",
+    13: "NonStop (NSK/NSS)",
+    15: "Open TP1",
+    18: "z/VM",
+    23: "z/TPF",
+    27: "z/VSE",
+    28: "IBM MQ Appliance",
+}
 
 
 class BannerArgumentParser(argparse.ArgumentParser):
@@ -128,6 +143,10 @@ def format_spi_verb(verb: SpiVerb) -> str:
         f"max_out={verb.max_out_version} "
         f"flags=0x{verb.flags:08x}"
     )
+
+
+def format_mq_platform(platform: int) -> str:
+    return f"{platform} ({MQ_PLATFORM_NAMES.get(platform, 'unknown platform')})"
 
 
 def _build_mqi_packet(
