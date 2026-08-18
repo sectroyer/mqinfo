@@ -248,6 +248,27 @@ def _parse_mqi_reply(packet: bytes, expected_segment: int, swap: bool) -> tuple[
     )
 
 
+def _recv_spanned_mqi_reply(session_sock: object) -> bytes:
+    """Receive an MQI reply and append any RFP continuation payloads.
+
+    MQGET replies can be segmented before the fixed MQMD/MQGMO portion as well
+    as within message data.  The first TSH supplies the reply type and all
+    continuations contribute only their payload.
+    """
+    packet = mqlogin.recv_tsh_packet(session_sock)
+    combined = bytearray(packet)
+    segments = 1
+    while len(packet) >= mqlogin.TSH_HEADER_SIZE and not (packet[10] & mqlogin.RFP_TCF_LAST):
+        if segments >= 1024:
+            raise ValueError("too many MQI reply continuation segments")
+        packet = mqlogin.recv_tsh_packet(session_sock)
+        if len(packet) < mqlogin.TSH_HEADER_SIZE:
+            raise ValueError("short MQI reply continuation")
+        combined.extend(packet[mqlogin.TSH_HEADER_SIZE :])
+        segments += 1
+    return bytes(combined)
+
+
 def build_mqinq_packet(handle: int, selectors: list[int], char_attr_length: int, swap: bool, ccsid: int) -> bytes:
     int_attr_count = sum(selector <= 2000 for selector in selectors)
     body = bytearray(12 + 4 * len(selectors))
@@ -265,7 +286,7 @@ def inquire(session_sock: object, handle: int, selectors: list[int], char_attr_l
     try:
         packet = build_mqinq_packet(handle, selectors, char_attr_length, swap, ccsid)
         session_sock.sendall(packet)
-        reply = mqlogin.recv_tsh_packet(session_sock)
+        reply = _recv_spanned_mqi_reply(session_sock)
         comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQINQ_REPLY, swap)
         if comp_code == 2:
             return MqiInquireResult(comp_code, reason_code)
@@ -438,14 +459,21 @@ def browse_message(
     """Browse, never consume, at most ``max_bytes`` from the current cursor position."""
     try:
         session_sock.sendall(build_mqget_browse_packet(handle, max_bytes, swap, ccsid, browse_option))
-        reply = mqlogin.recv_tsh_packet(session_sock)
+        reply = _recv_spanned_mqi_reply(session_sock)
         comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQGET_REPLY, swap)
         if comp_code == 2:
             return BrowseResult(comp_code, reason_code)
         base = mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE
         data_offset = base + MQMD_V1_SIZE + MQGMO_V1_SIZE
         if len(reply) < data_offset + 4:
-            return BrowseResult(comp_code, reason_code, error_text="truncated MQGET reply")
+            return BrowseResult(
+                comp_code,
+                reason_code,
+                error_text=(
+                    f"truncated MQGET reply (received {len(reply)} bytes; "
+                    f"need at least {data_offset + 4} bytes for MQMD/MQGMO/data length)"
+                ),
+            )
         data_length = mqlogin.read_u32_ordered(reply, data_offset, swap)
         body_start = data_offset + 4
         data = reply[body_start : body_start + min(max_bytes, data_length)]
