@@ -48,6 +48,7 @@ MQOD_V1_SIZE = 168
 MQOPEN_PRIV_V1_SIZE = 28
 MQOO_INQUIRE = 0x00000020
 MQCO_NONE = 0
+MQHO_NONE = 0xFFFFFFFF
 MQIA_CODED_CHAR_SET_ID = 2
 MQIA_MAX_MSG_LENGTH = 13
 MQIA_MAX_PRIORITY = 14
@@ -137,10 +138,10 @@ def _build_mqi_packet(segment_type: int, handle: int, body: bytes, swap: bool, c
 
 
 def _parse_mqi_reply(packet: bytes, expected_segment: int, swap: bool) -> tuple[int, int]:
+    if len(packet) >= mqlogin.TSH_HEADER_SIZE and packet[9] == mqlogin.RFP_TST_STATUS_INFO:
+        raise ValueError(mqlogin.describe_error_status(packet))
     if len(packet) < mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE:
         raise ValueError("short MQI reply")
-    if packet[9] == mqlogin.RFP_TST_STATUS_INFO:
-        raise ValueError(mqlogin.describe_error_status(packet))
     if packet[9] != expected_segment:
         raise ValueError(f"unexpected MQI reply segment {packet[9]}")
     base = mqlogin.TSH_HEADER_SIZE
@@ -186,11 +187,21 @@ def build_mqopen_packet(object_name: str, swap: bool, ccsid: int, fap_level: int
     name = mqlogin.encode_mq_bytes(object_name, ccsid)
     if not name or len(name) > 48:
         raise ValueError("object name must contain 1 to 48 encoded bytes")
-    od = bytearray(b"OD  " + b"\x00" * (MQOD_V1_SIZE - 4))
+    # MQOD V1 fields are fixed-width MQ character fields.  The IBM client
+    # writes empty fields as CCSID-specific spaces and defaults DynamicQName
+    # to AMQ.*; NUL-filled fields are rejected as MQRC_OD_ERROR (2044).
+    space = mqlogin.encode_mq_bytes(" ", ccsid)
+    def mq_field(value: bytes, length: int) -> bytes:
+        return value[:length].ljust(length, space)
+
+    od = bytearray(MQOD_V1_SIZE)
+    od[0:4] = mq_field(mqlogin.encode_mq_bytes("OD  ", ccsid), 4)
     mqlogin.write_u32_ordered(od, 4, 1, swap)
     mqlogin.write_u32_ordered(od, 8, 1, swap)  # MQOT_Q
-    od[12 : 12 + len(name)] = name
-    od[12 + len(name) : 60] = b" " * (48 - len(name))
+    od[12:60] = mq_field(name, 48)
+    od[60:108] = mq_field(b"", 48)
+    od[108:156] = mq_field(mqlogin.encode_mq_bytes("AMQ.*", ccsid), 48)
+    od[156:168] = mq_field(b"", 12)
     body = od + MQOO_INQUIRE.to_bytes(4, "little" if swap else "big")
     if fap_level >= 9:
         private = bytearray(b"FOPA" + b"\x00" * (MQOPEN_PRIV_V1_SIZE - 4))
@@ -230,7 +241,8 @@ def close_object(session_sock: object, handle: int, swap: bool, ccsid: int) -> N
 
 def inquire_queue_manager(session_sock: object, swap: bool, ccsid: int) -> tuple[dict[str, int | str], MqiInquireResult]:
     selectors = [selector for _, selector in QMGR_INFO_SELECTORS] + [MQCA_Q_MGR_NAME]
-    result = inquire(session_sock, 0, selectors, 48, swap, ccsid)
+    # MQINQ on the queue manager uses MQHO_NONE, not the MQCONN handle.
+    result = inquire(session_sock, MQHO_NONE, selectors, 48, swap, ccsid)
     if result.error_text or result.comp_code == 2 or result.int_attributes is None:
         return {}, result
     values: dict[str, int | str] = {
