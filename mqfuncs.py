@@ -37,6 +37,35 @@ SPI_VERB_NAMES = {
     12: "OPEN",
 }
 
+# Raw MQI flow types and a deliberately small set of read-only inquiry values.
+RFP_TST_MQOPEN = 131
+RFP_TST_MQCLOSE = 132
+RFP_TST_MQINQ = 137
+RFP_TST_MQOPEN_REPLY = 147
+RFP_TST_MQCLOSE_REPLY = 148
+RFP_TST_MQINQ_REPLY = 153
+MQOD_V1_SIZE = 168
+MQOPEN_PRIV_V1_SIZE = 28
+MQOO_INQUIRE = 0x00000020
+MQCO_NONE = 0
+MQIA_CODED_CHAR_SET_ID = 2
+MQIA_MAX_MSG_LENGTH = 13
+MQIA_MAX_PRIORITY = 14
+MQIA_COMMAND_LEVEL = 31
+MQIA_PLATFORM = 32
+MQCA_Q_MGR_NAME = 2015
+MQIA_CURRENT_Q_DEPTH = 3
+MQIA_MAX_Q_DEPTH = 15
+MQIA_Q_TYPE = 20
+MQCA_Q_NAME = 2016
+QMGR_INFO_SELECTORS = (
+    ("coded_char_set_id", MQIA_CODED_CHAR_SET_ID),
+    ("max_message_length", MQIA_MAX_MSG_LENGTH),
+    ("max_priority", MQIA_MAX_PRIORITY),
+    ("command_level", MQIA_COMMAND_LEVEL),
+    ("platform", MQIA_PLATFORM),
+)
+
 
 class BannerArgumentParser(argparse.ArgumentParser):
     def format_help(self) -> str:
@@ -79,6 +108,15 @@ class QueryResult:
     stage: str | None = None
 
 
+@dataclass
+class MqiInquireResult:
+    comp_code: int
+    reason_code: int
+    int_attributes: list[int] | None = None
+    char_attributes: bytes = b""
+    error_text: str | None = None
+
+
 def format_spi_verb(verb: SpiVerb) -> str:
     """Format a non-empty SPI capability entry returned by SPI QUERY."""
     return (
@@ -88,6 +126,138 @@ def format_spi_verb(verb: SpiVerb) -> str:
         f"max_out={verb.max_out_version} "
         f"flags=0x{verb.flags:08x}"
     )
+
+
+def _build_mqi_packet(segment_type: int, handle: int, body: bytes, swap: bool, ccsid: int) -> bytes:
+    payload = bytearray(mqlogin.MQAPI_HEADER_SIZE + len(body))
+    mqlogin.write_u32(payload, 0, len(payload) + mqlogin.TSH_HEADER_SIZE)
+    mqlogin.write_u32_ordered(payload, 12, handle, swap)
+    payload[mqlogin.MQAPI_HEADER_SIZE :] = body
+    return mqlogin.build_tsh(segment_type, len(payload), mqlogin.RFP_TCF_FIRST | mqlogin.RFP_TCF_LAST, ccsid) + payload
+
+
+def _parse_mqi_reply(packet: bytes, expected_segment: int, swap: bool) -> tuple[int, int]:
+    if len(packet) < mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE:
+        raise ValueError("short MQI reply")
+    if packet[9] == mqlogin.RFP_TST_STATUS_INFO:
+        raise ValueError(mqlogin.describe_error_status(packet))
+    if packet[9] != expected_segment:
+        raise ValueError(f"unexpected MQI reply segment {packet[9]}")
+    base = mqlogin.TSH_HEADER_SIZE
+    return (
+        mqlogin.read_u32_ordered(packet, base + 4, swap),
+        mqlogin.read_u32_ordered(packet, base + 8, swap),
+    )
+
+
+def build_mqinq_packet(handle: int, selectors: list[int], char_attr_length: int, swap: bool, ccsid: int) -> bytes:
+    int_attr_count = sum(selector <= 2000 for selector in selectors)
+    body = bytearray(12 + 4 * len(selectors))
+    mqlogin.write_u32_ordered(body, 0, len(selectors), swap)
+    mqlogin.write_u32_ordered(body, 4, int_attr_count, swap)
+    mqlogin.write_u32_ordered(body, 8, char_attr_length, swap)
+    for index, selector in enumerate(selectors):
+        mqlogin.write_u32_ordered(body, 12 + index * 4, selector, swap)
+    return _build_mqi_packet(RFP_TST_MQINQ, handle, body, swap, ccsid)
+
+
+def inquire(session_sock: object, handle: int, selectors: list[int], char_attr_length: int, swap: bool, ccsid: int) -> MqiInquireResult:
+    """Perform a read-only MQINQ on an existing MQCONN/MQOPEN handle."""
+    try:
+        packet = build_mqinq_packet(handle, selectors, char_attr_length, swap, ccsid)
+        session_sock.sendall(packet)
+        reply = mqlogin.recv_tsh_packet(session_sock)
+        comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQINQ_REPLY, swap)
+        if comp_code == 2:
+            return MqiInquireResult(comp_code, reason_code)
+        int_count = sum(selector <= 2000 for selector in selectors)
+        offset = mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE + 12 + 4 * len(selectors)
+        required = offset + int_count * 4 + char_attr_length
+        if len(reply) < required:
+            return MqiInquireResult(comp_code, reason_code, error_text="truncated MQINQ reply")
+        int_attributes = [mqlogin.read_u32_ordered(reply, offset + 4 * index, swap) for index in range(int_count)]
+        char_offset = offset + int_count * 4
+        return MqiInquireResult(comp_code, reason_code, int_attributes, reply[char_offset : char_offset + char_attr_length])
+    except Exception as exc:
+        return MqiInquireResult(2, 2195, error_text=str(exc))
+
+
+def build_mqopen_packet(object_name: str, swap: bool, ccsid: int, fap_level: int) -> bytes:
+    name = mqlogin.encode_mq_bytes(object_name, ccsid)
+    if not name or len(name) > 48:
+        raise ValueError("object name must contain 1 to 48 encoded bytes")
+    od = bytearray(b"OD  " + b"\x00" * (MQOD_V1_SIZE - 4))
+    mqlogin.write_u32_ordered(od, 4, 1, swap)
+    mqlogin.write_u32_ordered(od, 8, 1, swap)  # MQOT_Q
+    od[12 : 12 + len(name)] = name
+    od[12 + len(name) : 60] = b" " * (48 - len(name))
+    body = od + MQOO_INQUIRE.to_bytes(4, "little" if swap else "big")
+    if fap_level >= 9:
+        private = bytearray(b"FOPA" + b"\x00" * (MQOPEN_PRIV_V1_SIZE - 4))
+        for offset in (4, 8):
+            mqlogin.write_u32_ordered(private, offset, 1 if offset == 4 else MQOPEN_PRIV_V1_SIZE, swap)
+        mqlogin.write_u32_ordered(private, 12, 0xFFFFFFFF, swap)
+        mqlogin.write_u32_ordered(private, 16, 0xFFFFFFFF, swap)
+        body += private
+    return _build_mqi_packet(RFP_TST_MQOPEN, 0, body, swap, ccsid)
+
+
+def open_for_inquire(session_sock: object, object_name: str, swap: bool, ccsid: int, fap_level: int) -> tuple[int | None, MqiInquireResult]:
+    try:
+        session_sock.sendall(build_mqopen_packet(object_name, swap, ccsid, fap_level))
+        reply = mqlogin.recv_tsh_packet(session_sock)
+        comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQOPEN_REPLY, swap)
+        if comp_code == 2:
+            return None, MqiInquireResult(comp_code, reason_code)
+        handle = mqlogin.read_u32_ordered(reply, mqlogin.TSH_HEADER_SIZE + 12, swap)
+        return handle, MqiInquireResult(comp_code, reason_code)
+    except Exception as exc:
+        return None, MqiInquireResult(2, 2195, error_text=str(exc))
+
+
+def close_object(session_sock: object, handle: int, swap: bool, ccsid: int) -> None:
+    session_sock.sendall(
+        _build_mqi_packet(
+            RFP_TST_MQCLOSE,
+            handle,
+            MQCO_NONE.to_bytes(4, "little" if swap else "big"),
+            swap,
+            ccsid,
+        )
+    )
+    _parse_mqi_reply(mqlogin.recv_tsh_packet(session_sock), RFP_TST_MQCLOSE_REPLY, swap)
+
+
+def inquire_queue_manager(session_sock: object, swap: bool, ccsid: int) -> tuple[dict[str, int | str], MqiInquireResult]:
+    selectors = [selector for _, selector in QMGR_INFO_SELECTORS] + [MQCA_Q_MGR_NAME]
+    result = inquire(session_sock, 0, selectors, 48, swap, ccsid)
+    if result.error_text or result.comp_code == 2 or result.int_attributes is None:
+        return {}, result
+    values: dict[str, int | str] = {
+        name: value for (name, _), value in zip(QMGR_INFO_SELECTORS, result.int_attributes)
+    }
+    values["queue_manager_name"] = mqlogin.decode_mq_field(result.char_attributes, ccsid)
+    return values, result
+
+
+def inquire_queue(session_sock: object, object_name: str, swap: bool, ccsid: int, fap_level: int) -> tuple[dict[str, int | str], MqiInquireResult]:
+    """Open a queue with MQOO_INQUIRE only, return attributes, then close it."""
+    handle, open_result = open_for_inquire(session_sock, object_name, swap, ccsid, fap_level)
+    if handle is None:
+        return {}, open_result
+    try:
+        selectors = [MQIA_CURRENT_Q_DEPTH, MQIA_MAX_Q_DEPTH, MQIA_Q_TYPE, MQCA_Q_NAME]
+        result = inquire(session_sock, handle, selectors, 48, swap, ccsid)
+        if result.error_text or result.comp_code == 2 or result.int_attributes is None:
+            return {}, result
+        return {
+            "current_depth": result.int_attributes[0],
+            "max_depth": result.int_attributes[1],
+            "queue_type": result.int_attributes[2],
+            "queue_name": mqlogin.decode_mq_field(result.char_attributes, ccsid),
+        }, result
+    finally:
+        close_object(session_sock, handle, swap, ccsid)
 
 
 def build_parser() -> argparse.ArgumentParser:
