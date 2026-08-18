@@ -129,9 +129,18 @@ def format_spi_verb(verb: SpiVerb) -> str:
     )
 
 
-def _build_mqi_packet(segment_type: int, handle: int, body: bytes, swap: bool, ccsid: int) -> bytes:
+def _build_mqi_packet(
+    segment_type: int,
+    handle: int,
+    body: bytes,
+    swap: bool,
+    ccsid: int,
+    expected_reply_bytes: int = 0,
+) -> bytes:
     payload = bytearray(mqlogin.MQAPI_HEADER_SIZE + len(body))
-    mqlogin.write_u32(payload, 0, len(payload) + mqlogin.TSH_HEADER_SIZE)
+    # RfpMQAPI CallLength includes the request and the caller-provided output
+    # buffer.  TransLength (the TSH length) covers the request only.
+    mqlogin.write_u32(payload, 0, len(payload) + mqlogin.TSH_HEADER_SIZE + expected_reply_bytes)
     mqlogin.write_u32_ordered(payload, 12, handle, swap)
     payload[mqlogin.MQAPI_HEADER_SIZE :] = body
     return mqlogin.build_tsh(segment_type, len(payload), mqlogin.RFP_TCF_FIRST | mqlogin.RFP_TCF_LAST, ccsid) + payload
@@ -159,7 +168,8 @@ def build_mqinq_packet(handle: int, selectors: list[int], char_attr_length: int,
     mqlogin.write_u32_ordered(body, 8, char_attr_length, swap)
     for index, selector in enumerate(selectors):
         mqlogin.write_u32_ordered(body, 12 + index * 4, selector, swap)
-    return _build_mqi_packet(RFP_TST_MQINQ, handle, body, swap, ccsid)
+    expected_reply_bytes = int_attr_count * 4 + char_attr_length + 1
+    return _build_mqi_packet(RFP_TST_MQINQ, handle, body, swap, ccsid, expected_reply_bytes)
 
 
 def inquire(session_sock: object, handle: int, selectors: list[int], char_attr_length: int, swap: bool, ccsid: int) -> MqiInquireResult:
@@ -269,7 +279,12 @@ def inquire_queue(session_sock: object, object_name: str, swap: bool, ccsid: int
             "queue_name": mqlogin.decode_mq_field(result.char_attributes, ccsid),
         }, result
     finally:
-        close_object(session_sock, handle, swap, ccsid)
+        # A failed MQINQ can cause the queue manager to close the socket. Do
+        # not hide the inquiry result with a secondary best-effort close error.
+        try:
+            close_object(session_sock, handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
 
 
 def build_parser() -> argparse.ArgumentParser:
