@@ -16,6 +16,10 @@ MQCFT_INTEGER_LIST = 5
 MQCFC_LAST = 1
 MQCFC_NOT_LAST = 0
 MQCFH_SIZE = 36
+MQCMD_INQUIRE_Q = 13
+MQCA_Q_NAME = 2016
+MQIACF_Q_ATTRS = 1002
+MQCCSI_UTF8 = 1208
 
 
 @dataclass(frozen=True)
@@ -30,6 +34,30 @@ class PcfResponse:
 
 def _signed(value: int) -> int:
     return value - 0x100000000 if value >= 0x80000000 else value
+
+
+def _pad4(value: bytes) -> bytes:
+    return value + b"\x00" * ((-len(value)) % 4)
+
+
+def build_inquire_q_request(pattern: str, attributes: list[int]) -> bytes:
+    """Build a read-only PCF MQCMD_INQUIRE_Q request payload."""
+    encoded = pattern.encode("utf-8")
+    if not encoded or len(encoded) > 48:
+        raise ValueError("queue pattern must contain 1 to 48 UTF-8 bytes")
+    if not attributes:
+        raise ValueError("at least one queue attribute selector is required")
+    name = _pad4(encoded)
+    name_parameter = struct.pack(
+        ">IIIII", MQCFT_STRING, 20 + len(name), MQCA_Q_NAME, MQCCSI_UTF8, len(encoded)
+    ) + name
+    attributes_parameter = struct.pack(
+        ">IIII", MQCFT_INTEGER_LIST, 16 + 4 * len(attributes), MQIACF_Q_ATTRS, len(attributes)
+    ) + struct.pack(f">{len(attributes)}I", *attributes)
+    header = struct.pack(
+        ">IIIIIIIII", MQCFT_COMMAND, MQCFH_SIZE, 3, MQCMD_INQUIRE_Q, 1, MQCFC_LAST, 0, 0, 2
+    )
+    return header + name_parameter + attributes_parameter
 
 
 def _decode_string(value: bytes, ccsid: int) -> str:
