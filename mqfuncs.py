@@ -48,7 +48,8 @@ MQOD_V1_SIZE = 168
 MQOPEN_PRIV_V1_SIZE = 28
 MQOO_INQUIRE = 0x00000020
 MQCO_NONE = 0
-MQHO_NONE = 0xFFFFFFFF
+MQOT_Q = 1
+MQOT_Q_MGR = 5
 MQIA_CODED_CHAR_SET_ID = 2
 MQIA_MAX_MSG_LENGTH = 13
 MQIA_MAX_PRIORITY = 14
@@ -193,9 +194,11 @@ def inquire(session_sock: object, handle: int, selectors: list[int], char_attr_l
         return MqiInquireResult(2, 2195, error_text=str(exc))
 
 
-def build_mqopen_packet(object_name: str, swap: bool, ccsid: int, fap_level: int) -> bytes:
-    name = mqlogin.encode_mq_bytes(object_name, ccsid)
-    if not name or len(name) > 48:
+def build_mqopen_packet(
+    object_name: str | None, object_type: int, swap: bool, ccsid: int, fap_level: int
+) -> bytes:
+    name = mqlogin.encode_mq_bytes(object_name or "", ccsid)
+    if object_name is not None and (not name or len(name) > 48):
         raise ValueError("object name must contain 1 to 48 encoded bytes")
     # MQOD V1 fields are fixed-width MQ character fields.  The IBM client
     # writes empty fields as CCSID-specific spaces and defaults DynamicQName
@@ -207,7 +210,7 @@ def build_mqopen_packet(object_name: str, swap: bool, ccsid: int, fap_level: int
     od = bytearray(MQOD_V1_SIZE)
     od[0:4] = mq_field(mqlogin.encode_mq_bytes("OD  ", ccsid), 4)
     mqlogin.write_u32_ordered(od, 4, 1, swap)
-    mqlogin.write_u32_ordered(od, 8, 1, swap)  # MQOT_Q
+    mqlogin.write_u32_ordered(od, 8, object_type, swap)
     od[12:60] = mq_field(name, 48)
     od[60:108] = mq_field(b"", 48)
     od[108:156] = mq_field(mqlogin.encode_mq_bytes("AMQ.*", ccsid), 48)
@@ -223,9 +226,16 @@ def build_mqopen_packet(object_name: str, swap: bool, ccsid: int, fap_level: int
     return _build_mqi_packet(RFP_TST_MQOPEN, 0, body, swap, ccsid)
 
 
-def open_for_inquire(session_sock: object, object_name: str, swap: bool, ccsid: int, fap_level: int) -> tuple[int | None, MqiInquireResult]:
+def open_for_inquire(
+    session_sock: object,
+    object_name: str | None,
+    object_type: int,
+    swap: bool,
+    ccsid: int,
+    fap_level: int,
+) -> tuple[int | None, MqiInquireResult]:
     try:
-        session_sock.sendall(build_mqopen_packet(object_name, swap, ccsid, fap_level))
+        session_sock.sendall(build_mqopen_packet(object_name, object_type, swap, ccsid, fap_level))
         reply = mqlogin.recv_tsh_packet(session_sock)
         comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQOPEN_REPLY, swap)
         if comp_code == 2:
@@ -251,20 +261,28 @@ def close_object(session_sock: object, handle: int, swap: bool, ccsid: int) -> N
 
 def inquire_queue_manager(session_sock: object, swap: bool, ccsid: int) -> tuple[dict[str, int | str], MqiInquireResult]:
     selectors = [selector for _, selector in QMGR_INFO_SELECTORS] + [MQCA_Q_MGR_NAME]
-    # MQINQ on the queue manager uses MQHO_NONE, not the MQCONN handle.
-    result = inquire(session_sock, MQHO_NONE, selectors, 48, swap, ccsid)
-    if result.error_text or result.comp_code == 2 or result.int_attributes is None:
-        return {}, result
-    values: dict[str, int | str] = {
-        name: value for (name, _), value in zip(QMGR_INFO_SELECTORS, result.int_attributes)
-    }
-    values["queue_manager_name"] = mqlogin.decode_mq_field(result.char_attributes, ccsid)
-    return values, result
+    handle, open_result = open_for_inquire(session_sock, None, MQOT_Q_MGR, swap, ccsid, 9)
+    if handle is None:
+        return {}, open_result
+    try:
+        result = inquire(session_sock, handle, selectors, 48, swap, ccsid)
+        if result.error_text or result.comp_code == 2 or result.int_attributes is None:
+            return {}, result
+        values: dict[str, int | str] = {
+            name: value for (name, _), value in zip(QMGR_INFO_SELECTORS, result.int_attributes)
+        }
+        values["queue_manager_name"] = mqlogin.decode_mq_field(result.char_attributes, ccsid)
+        return values, result
+    finally:
+        try:
+            close_object(session_sock, handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
 
 
 def inquire_queue(session_sock: object, object_name: str, swap: bool, ccsid: int, fap_level: int) -> tuple[dict[str, int | str], MqiInquireResult]:
     """Open a queue with MQOO_INQUIRE only, return attributes, then close it."""
-    handle, open_result = open_for_inquire(session_sock, object_name, swap, ccsid, fap_level)
+    handle, open_result = open_for_inquire(session_sock, object_name, MQOT_Q, swap, ccsid, fap_level)
     if handle is None:
         return {}, open_result
     try:
