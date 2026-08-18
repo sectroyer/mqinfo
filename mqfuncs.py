@@ -46,10 +46,14 @@ RFP_TST_MQCLOSE_REPLY = 148
 RFP_TST_MQINQ_REPLY = 153
 RFP_TST_MQGET = 133
 RFP_TST_MQGET_REPLY = 149
+RFP_TST_MQPUT = 134
+RFP_TST_MQPUT_REPLY = 150
 MQOD_V1_SIZE = 168
 MQOPEN_PRIV_V1_SIZE = 28
 MQOO_INQUIRE = 0x00000020
 MQOO_BROWSE = 0x00000008
+MQOO_INPUT_SHARED = 0x00000002
+MQOO_FAIL_IF_QUIESCING = 0x00002000
 MQCO_NONE = 0
 MQOT_Q = 1
 MQOT_Q_MGR = 5
@@ -58,6 +62,17 @@ MQGMO_BROWSE_NEXT = 0x00000020
 MQGMO_ACCEPT_TRUNCATED_MSG = 0x00000040
 MQMD_V1_SIZE = 324
 MQGMO_V1_SIZE = 72
+MQPMO_V1_SIZE = 128
+MQPMO_NO_SYNCPOINT = 0x00000004
+MQPMO_NEW_MSG_ID = 0x00000040
+MQPMO_FAIL_IF_QUIESCING = 0x00002000
+MQMD_MSG_ID_OFFSET = 48
+MQMD_CORREL_ID_OFFSET = 72
+MQMD_REPLY_TO_Q_OFFSET = 100
+MQMD_REPLY_TO_Q_MGR_OFFSET = 148
+MQMD_FORMAT_OFFSET = 32
+MQMD_ID_SIZE = 24
+PCF_REPLY_MODEL_QUEUE = "SYSTEM.DEFAULT.MODEL.QUEUE"
 MQIA_CODED_CHAR_SET_ID = 2
 MQIA_MAX_MSG_LENGTH = 13
 MQIA_MAX_PRIORITY = 14
@@ -314,6 +329,7 @@ def build_mqopen_packet(
     ccsid: int,
     fap_level: int,
     open_options: int = MQOO_INQUIRE,
+    dynamic_queue_name: str = "AMQ.*",
 ) -> bytes:
     name = mqlogin.encode_mq_bytes(object_name or "", ccsid)
     if object_name is not None and (not name or len(name) > 48):
@@ -331,7 +347,10 @@ def build_mqopen_packet(
     mqlogin.write_u32_ordered(od, 8, object_type, swap)
     od[12:60] = mq_field(name, 48)
     od[60:108] = mq_field(b"", 48)
-    od[108:156] = mq_field(mqlogin.encode_mq_bytes("AMQ.*", ccsid), 48)
+    dynamic_name = mqlogin.encode_mq_bytes(dynamic_queue_name, ccsid)
+    if not dynamic_name or len(dynamic_name) > 48:
+        raise ValueError("dynamic queue name must contain 1 to 48 encoded bytes")
+    od[108:156] = mq_field(dynamic_name, 48)
     od[156:168] = mq_field(b"", 12)
     body = od + open_options.to_bytes(4, "little" if swap else "big")
     if fap_level >= 9:
@@ -342,6 +361,75 @@ def build_mqopen_packet(
         mqlogin.write_u32_ordered(private, 16, 0xFFFFFFFF, swap)
         body += private
     return _build_mqi_packet(RFP_TST_MQOPEN, 0, body, swap, ccsid)
+
+
+def build_dynamic_reply_mqopen_packet(swap: bool, ccsid: int, fap_level: int) -> bytes:
+    """Build an MQOPEN for a transient dynamic PCF reply queue.
+
+    The queue manager derives a unique name from the model queue and the
+    `AMQ.PCF.*` prefix.  This helper only constructs bytes; it performs no I/O.
+    """
+    return build_mqopen_packet(
+        PCF_REPLY_MODEL_QUEUE,
+        MQOT_Q,
+        swap,
+        ccsid,
+        fap_level,
+        MQOO_INPUT_SHARED | MQOO_FAIL_IF_QUIESCING,
+        "AMQ.PCF.*",
+    )
+
+
+def build_pcf_request_mqmd(reply_to_queue: str, ccsid: int, reply_to_qmgr: str = "", swap: bool = False) -> bytes:
+    """Build an MQMD V1 for a PCF command request; no message is sent."""
+    def field(value: str, length: int) -> bytes:
+        raw = mqlogin.encode_mq_bytes(value, ccsid)
+        if len(raw) > length:
+            raise ValueError("MQMD character field exceeds its fixed width")
+        return raw.ljust(length, mqlogin.encode_mq_bytes(" ", ccsid))
+
+    md = bytearray(MQMD_V1_SIZE)
+    md[0:4] = field("MD  ", 4)
+    mqlogin.write_u32_ordered(md, 4, 1, swap)
+    mqlogin.write_u32_ordered(md, 28, ccsid, swap)
+    md[MQMD_FORMAT_OFFSET : MQMD_FORMAT_OFFSET + 8] = field("MQPCF", 8)
+    md[MQMD_REPLY_TO_Q_OFFSET : MQMD_REPLY_TO_Q_OFFSET + 48] = field(reply_to_queue, 48)
+    md[MQMD_REPLY_TO_Q_MGR_OFFSET : MQMD_REPLY_TO_Q_MGR_OFFSET + 48] = field(reply_to_qmgr, 48)
+    return bytes(md)
+
+
+def build_mqput_packet(handle: int, mqmd: bytes, message: bytes, swap: bool, ccsid: int) -> bytes:
+    """Build an MQPUT request for a non-persistent PCF command message.
+
+    This function only serializes a packet. Callers must not send it until the
+    PCF request/reply flow has passed the remaining offline validation steps.
+    """
+    if len(mqmd) != MQMD_V1_SIZE:
+        raise ValueError("MQPUT requires an MQMD V1 structure")
+    pmo = bytearray(MQPMO_V1_SIZE)
+    pmo[0:4] = mqlogin.encode_mq_bytes("PMO ", ccsid)
+    mqlogin.write_u32_ordered(pmo, 4, 1, swap)
+    mqlogin.write_u32_ordered(
+        pmo, 8, MQPMO_NO_SYNCPOINT | MQPMO_NEW_MSG_ID | MQPMO_FAIL_IF_QUIESCING, swap
+    )
+    # The remaining V1 fields are reserved/context fields and are zero.
+    return _build_mqi_packet(
+        RFP_TST_MQPUT,
+        handle,
+        mqmd + pmo + message,
+        swap,
+        ccsid,
+        MQMD_V1_SIZE + MQPMO_V1_SIZE,
+    )
+
+
+def response_matches_request(response_mqmd: bytes, request_message_id: bytes) -> bool:
+    """Return whether a reply MQMD correlates to the PCF request message ID."""
+    return (
+        len(response_mqmd) >= MQMD_CORREL_ID_OFFSET + MQMD_ID_SIZE
+        and len(request_message_id) == MQMD_ID_SIZE
+        and response_mqmd[MQMD_CORREL_ID_OFFSET : MQMD_CORREL_ID_OFFSET + MQMD_ID_SIZE] == request_message_id
+    )
 
 
 def open_for_inquire(
