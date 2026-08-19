@@ -791,7 +791,7 @@ def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_stat
     protected_password_len = remote_ppa_finish_auth_flow(payload, 20, password_offset, r_state, ppa, swap)
     if protected_password_len < 0:
         raise ValueError(f"unsupported MQ password protection algorithm: {ppa}")
-    # RfpCAUT keeps PasswordLen as the original password byte count. The Java
+    # RfpCAUT keeps PasswordLen as the original password byte count. The 
     # client uses the padded protected length only when calculating TSH length.
     # `payload` grows when RemotePPA writes the DES-padded bytes.
     tsh = build_tsh(RFP_TST_CONAUTH_INFO, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST, ccsid)

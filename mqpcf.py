@@ -17,8 +17,10 @@ MQCFC_LAST = 1
 MQCFC_NOT_LAST = 0
 MQCFH_SIZE = 36
 MQCMD_INQUIRE_Q = 13
+MQCMD_INQUIRE_Q_MGR = 2
 MQCA_Q_NAME = 2016
 MQIACF_Q_ATTRS = 1002
+MQIACF_Q_MGR_ATTRS = 1001
 MQCCSI_UTF8 = 1208
 
 
@@ -40,24 +42,46 @@ def _pad4(value: bytes) -> bytes:
     return value + b"\x00" * ((-len(value)) % 4)
 
 
-def build_inquire_q_request(pattern: str, attributes: list[int]) -> bytes:
+def build_inquire_q_request(
+    pattern: str, attributes: list[int], header_type: int = MQCFT_COMMAND, string_ccsid: int = MQCCSI_UTF8
+) -> bytes:
     """Build a read-only PCF MQCMD_INQUIRE_Q request payload."""
-    encoded = pattern.encode("utf-8")
+    codec = {819: "iso-8859-1", 870: "cp500", 1208: "utf-8"}.get(string_ccsid)
+    if codec is None:
+        raise ValueError(f"unsupported PCF string CCSID {string_ccsid}")
+    encoded = pattern.encode(codec)
     if not encoded or len(encoded) > 48:
-        raise ValueError("queue pattern must contain 1 to 48 UTF-8 bytes")
+        raise ValueError("queue pattern must contain 1 to 48 encoded bytes")
     if not attributes:
         raise ValueError("at least one queue attribute selector is required")
+    if header_type not in (MQCFT_COMMAND, 16):
+        raise ValueError("unsupported PCF command header type")
     name = _pad4(encoded)
     name_parameter = struct.pack(
-        ">IIIII", MQCFT_STRING, 20 + len(name), MQCA_Q_NAME, MQCCSI_UTF8, len(encoded)
+        ">IIIII", MQCFT_STRING, 20 + len(name), MQCA_Q_NAME, string_ccsid, len(encoded)
     ) + name
     attributes_parameter = struct.pack(
         ">IIII", MQCFT_INTEGER_LIST, 16 + 4 * len(attributes), MQIACF_Q_ATTRS, len(attributes)
     ) + struct.pack(f">{len(attributes)}I", *attributes)
     header = struct.pack(
-        ">IIIIIIIII", MQCFT_COMMAND, MQCFH_SIZE, 3, MQCMD_INQUIRE_Q, 1, MQCFC_LAST, 0, 0, 2
+        ">IIIIIIIII", header_type, MQCFH_SIZE, 3, MQCMD_INQUIRE_Q, 1, MQCFC_LAST, 0, 0, 2
     )
     return header + name_parameter + attributes_parameter
+
+
+def build_inquire_qmgr_request(attributes: list[int], header_type: int = MQCFT_COMMAND) -> bytes:
+    """Build a read-only PCF MQCMD_INQUIRE_Q_MGR request payload."""
+    if not attributes:
+        raise ValueError("at least one queue-manager attribute selector is required")
+    if header_type not in (MQCFT_COMMAND, 16):
+        raise ValueError("unsupported PCF command header type")
+    attributes_parameter = struct.pack(
+        ">IIII", MQCFT_INTEGER_LIST, 16 + 4 * len(attributes), MQIACF_Q_MGR_ATTRS, len(attributes)
+    ) + struct.pack(f">{len(attributes)}I", *attributes)
+    header = struct.pack(
+        ">IIIIIIIII", header_type, MQCFH_SIZE, 3, MQCMD_INQUIRE_Q_MGR, 1, MQCFC_LAST, 0, 0, 1
+    )
+    return header + attributes_parameter
 
 
 def _decode_string(value: bytes, ccsid: int) -> str:

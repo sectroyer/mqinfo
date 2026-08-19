@@ -220,4 +220,4 @@ Debug mode additionally prints:
 
 `mqlogin.py` tests one explicit credential set only. It does not perform username or password guessing.
 
-The `raw` backend is a direct Python implementation of the initial IBM MQ `ID` and `MQCONN/MQCSP` exchange based on IBM MQ Java client wire structures. It is intentionally narrow and best suited to straightforward TCP client-authentication checks against non-TLS listener channels.
+The `raw` backend is a direct Python implementation of the initial IBM MQ `ID` and `MQCONN/MQCSP` exchange structures. It is intentionally narrow and best suited to straightforward TCP client-authentication checks against non-TLS listener channels.

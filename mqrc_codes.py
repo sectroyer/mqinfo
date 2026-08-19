@@ -135,9 +135,6 @@ MQRC_NAMES = {
 }
 
 
-# Complete MQRC definitions extracted from the IBM MQ CMQC.java source on the
-# configured reference host. Existing entries above document the initially
-# observed values; this update completes the table for all source definitions.
 MQRC_NAMES.update({
 +    0: "MQRC_NONE",
     900: "MQRC_APPL_FIRST",
