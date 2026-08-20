@@ -55,6 +55,7 @@ MQOPEN_PRIV_V1_SIZE = 28
 MQOO_INQUIRE = 0x00000020
 MQOO_BROWSE = 0x00000008
 MQOO_INPUT_SHARED = 0x00000002
+MQOO_INPUT_EXCLUSIVE = 0x00000004
 MQOO_OUTPUT = 0x00000010
 MQOO_FAIL_IF_QUIESCING = 0x00002000
 MQCO_NONE = 0
@@ -69,6 +70,7 @@ MQGMO_V1_SIZE = 72
 MQGMO_V2_SIZE = 80
 MQGMO_WAIT = 0x00000001
 MQGMO_FAIL_IF_QUIESCING = 0x00002000
+MQGMO_CONVERT = 0x00004000
 MQMO_MATCH_CORREL_ID = 0x00000002
 MQPMO_V1_SIZE = 128
 MQPMO_V2_SIZE = 152
@@ -91,7 +93,7 @@ PCF_REPLY_MODEL_QUEUE = "SYSTEM.DEFAULT.MODEL.QUEUE"
 PCF_COMMAND_QUEUE = "SYSTEM.ADMIN.COMMAND.QUEUE"
 MQMT_REQUEST = 1
 MQRO_PASS_CORREL_ID = 64
-MQEI_UNLIMITED = -1
+PCF_REQUEST_EXPIRY = 300
 MQENC_NATIVE = 273
 MQPRI_AS_Q_DEF = -1
 MQPER_PERSISTENCE_AS_Q_DEF = 2
@@ -108,7 +110,10 @@ MQIA_DEF_PERSISTENCE = 5
 MQIA_INHIBIT_GET = 9
 MQIA_INHIBIT_PUT = 10
 MQIA_MAX_Q_DEPTH = 15
+MQIA_OPEN_INPUT_COUNT = 17
+MQIA_OPEN_OUTPUT_COUNT = 18
 MQIA_Q_TYPE = 20
+MQCA_BASE_Q_NAME = 2002
 MQCA_Q_NAME = 2016
 PCF_QUEUE_LIST_SELECTORS = (
     MQCA_Q_NAME,
@@ -249,6 +254,7 @@ class BrowseResult:
     ccsid: int | None = None
     format_name: str | None = None
     message_id: bytes | None = None
+    correlation_id: bytes | None = None
     error_text: str | None = None
 
 
@@ -444,7 +450,9 @@ def build_dynamic_reply_mqopen_packet(swap: bool, ccsid: int, fap_level: int) ->
         swap,
         ccsid,
         fap_level,
-        MQOO_INPUT_SHARED | MQOO_FAIL_IF_QUIESCING,
+        # PCFAgent uses an exclusive input handle for its private reply queue
+        # (8196). This prevents another consumer from stealing a reply.
+        MQOO_INPUT_EXCLUSIVE | MQOO_FAIL_IF_QUIESCING,
         "AMQ.PCF.*",
     )
 
@@ -457,7 +465,8 @@ def build_pcf_command_queue_mqopen_packet(swap: bool, ccsid: int, fap_level: int
         swap,
         ccsid,
         fap_level,
-        MQOO_OUTPUT | MQOO_FAIL_IF_QUIESCING,
+        # PCFAgent opens the command queue with output and inquire (8240).
+        MQOO_OUTPUT | MQOO_INQUIRE | MQOO_FAIL_IF_QUIESCING,
     )
 
 
@@ -525,7 +534,9 @@ def build_pcf_request_mqmd(reply_to_queue: str, ccsid: int, reply_to_qmgr: str =
     # generated request CorrelId to each reply on the dynamic reply queue.
     mqlogin.write_u32_ordered(md, MQMD_REPORT_OFFSET, MQRO_PASS_CORREL_ID, swap)
     mqlogin.write_u32_ordered(md, MQMD_MSG_TYPE_OFFSET, MQMT_REQUEST, swap)
-    mqlogin.write_u32_ordered(md, MQMD_EXPIRY_OFFSET, MQEI_UNLIMITED & 0xFFFFFFFF, swap)
+    # PCFAgent's default request expiry is 30 seconds, represented as 300
+    # tenths of a second in MQMD.Expiry.
+    mqlogin.write_u32_ordered(md, MQMD_EXPIRY_OFFSET, PCF_REQUEST_EXPIRY, swap)
     mqlogin.write_u32_ordered(md, MQMD_ENCODING_OFFSET, MQENC_NATIVE, swap)
     mqlogin.write_u32_ordered(md, 28, ccsid, swap)
     md[MQMD_FORMAT_OFFSET : MQMD_FORMAT_OFFSET + 8] = field("MQADMIN", 8)
@@ -587,10 +598,24 @@ def put_pcf_command(
     """Send one PCF command message and return its assigned correlation ID."""
     try:
         if debug:
+            reply_to_q = mqlogin.decode_mq_field(
+                mqmd[MQMD_REPLY_TO_Q_OFFSET : MQMD_REPLY_TO_Q_OFFSET + 48], ccsid
+            )
+            reply_to_qmgr = mqlogin.decode_mq_field(
+                mqmd[MQMD_REPLY_TO_Q_MGR_OFFSET : MQMD_REPLY_TO_Q_MGR_OFFSET + 48], ccsid
+            )
+            format_name = mqlogin.decode_mq_field(
+                mqmd[MQMD_FORMAT_OFFSET : MQMD_FORMAT_OFFSET + 8], ccsid
+            )
             print(
                 f"[debug] PCF MQPUT: hobj={command_handle} pcf_bytes={len(pcf_message)} "
                 f"mqmd_version={mqlogin.read_u32_ordered(mqmd, 4, swap)} "
-                f"report=0x{mqlogin.read_u32_ordered(mqmd, MQMD_REPORT_OFFSET, swap):08x}",
+                f"report=0x{mqlogin.read_u32_ordered(mqmd, MQMD_REPORT_OFFSET, swap):08x} "
+                f"msg_type={mqlogin.read_u32_ordered(mqmd, MQMD_MSG_TYPE_OFFSET, swap)} "
+                f"expiry={mqlogin.read_u32_ordered(mqmd, MQMD_EXPIRY_OFFSET, swap)} "
+                f"encoding={mqlogin.read_u32_ordered(mqmd, MQMD_ENCODING_OFFSET, swap)} "
+                f"ccsid={mqlogin.read_u32_ordered(mqmd, 28, swap)} format={format_name!r} "
+                f"reply_to_q={reply_to_q!r} reply_to_qmgr={reply_to_qmgr!r}",
                 file=sys.stderr,
             )
         session_sock.sendall(build_mqput_packet(command_handle, mqmd, pcf_message, swap, ccsid))
@@ -713,6 +738,87 @@ def inquire_queue(session_sock: object, object_name: str, swap: bool, ccsid: int
             pass
 
 
+def inquire_command_queue_target(
+    session_sock: object, swap: bool, ccsid: int, fap_level: int
+) -> tuple[dict[str, int | str], MqiInquireResult]:
+    """Resolve the PCF command-queue alias and inspect its local target.
+
+    This is limited to MQOO_INQUIRE and MQINQ: it neither puts a command nor
+    reads an application message.
+    """
+    alias_handle, open_result = open_for_inquire(
+        session_sock, PCF_COMMAND_QUEUE, MQOT_Q, swap, ccsid, fap_level
+    )
+    if alias_handle is None:
+        return {}, open_result
+    try:
+        alias_result = inquire(
+            session_sock,
+            alias_handle,
+            [MQIA_Q_TYPE, MQCA_Q_NAME, MQCA_BASE_Q_NAME],
+            96,
+            swap,
+            ccsid,
+        )
+    finally:
+        try:
+            close_object(session_sock, alias_handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
+
+    if alias_result.error_text or alias_result.comp_code == 2 or alias_result.int_attributes is None:
+        return {}, alias_result
+    alias_name = mqlogin.decode_mq_field(alias_result.char_attributes[:48], ccsid)
+    target_name = mqlogin.decode_mq_field(alias_result.char_attributes[48:96], ccsid)
+    values: dict[str, int | str] = {
+        "command_queue_name": alias_name,
+        "command_queue_type": alias_result.int_attributes[0],
+        "command_queue_target": target_name,
+    }
+    if not target_name:
+        return values, alias_result
+
+    target_handle, target_open_result = open_for_inquire(
+        session_sock, target_name, MQOT_Q, swap, ccsid, fap_level
+    )
+    if target_handle is None:
+        return values, target_open_result
+    try:
+        target_result = inquire(
+            session_sock,
+            target_handle,
+            [
+                MQIA_Q_TYPE,
+                MQIA_CURRENT_Q_DEPTH,
+                MQIA_MAX_Q_DEPTH,
+                MQIA_OPEN_INPUT_COUNT,
+                MQIA_OPEN_OUTPUT_COUNT,
+                MQCA_Q_NAME,
+            ],
+            48,
+            swap,
+            ccsid,
+        )
+    finally:
+        try:
+            close_object(session_sock, target_handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
+    if target_result.error_text or target_result.comp_code == 2 or target_result.int_attributes is None:
+        return values, target_result
+    values.update(
+        {
+            "target_queue_name": mqlogin.decode_mq_field(target_result.char_attributes, ccsid),
+            "target_queue_type": target_result.int_attributes[0],
+            "target_current_depth": target_result.int_attributes[1],
+            "target_max_depth": target_result.int_attributes[2],
+            "target_open_input_count": target_result.int_attributes[3],
+            "target_open_output_count": target_result.int_attributes[4],
+        }
+    )
+    return values, target_result
+
+
 def build_mqget_browse_packet(
     handle: int, max_bytes: int, swap: bool, ccsid: int, browse_option: int = MQGMO_BROWSE_FIRST
 ) -> bytes:
@@ -753,7 +859,9 @@ def build_pcf_reply_mqget_packet(
     gmo = bytearray(MQGMO_V2_SIZE)
     gmo[0:4] = mqlogin.encode_mq_bytes("GMO ", ccsid)
     mqlogin.write_u32_ordered(gmo, 4, 2, swap)
-    mqlogin.write_u32_ordered(gmo, 8, MQGMO_WAIT | MQGMO_FAIL_IF_QUIESCING, swap)
+    # PCFAgent defaults to MQGMO_WAIT | MQGMO_FAIL_IF_QUIESCING |
+    # MQGMO_CONVERT (24577).
+    mqlogin.write_u32_ordered(gmo, 8, MQGMO_WAIT | MQGMO_FAIL_IF_QUIESCING | MQGMO_CONVERT, swap)
     mqlogin.write_u32_ordered(gmo, 12, wait_interval_ms, swap)
     mqlogin.write_u32_ordered(gmo, 72, MQMO_MATCH_CORREL_ID, swap)
     body = md + gmo + max_bytes.to_bytes(4, "little" if swap else "big")
@@ -909,6 +1017,8 @@ def list_queues(
             debug,
         )
         if get_result.comp_code == 2:
+            if debug and get_result.reason_code == 2033:
+                debug_browse_unmatched_pcf_reply(session_sock, reply_queue.name, swap, ccsid, fap_level)
             detail = get_result.error_text or mqlogin.format_mqrc(get_result.reason_code)
             return PcfQueueListResult([], get_result.comp_code, get_result.reason_code, f"correlated PCF MQGET failed: {detail}")
         for response in responses:
@@ -970,6 +1080,8 @@ def probe_queue_manager_pcf(
             debug,
         )
         if get_result.comp_code == 2:
+            if debug and get_result.reason_code == 2033:
+                debug_browse_unmatched_pcf_reply(session_sock, reply_queue.name, swap, ccsid, fap_level)
             return PcfQmgrProbeResult(responses, get_result.comp_code, get_result.reason_code, get_result.error_text)
         for response in responses:
             if getattr(response, "comp_code", 0) == 2:
@@ -1019,6 +1131,7 @@ def browse_message(
             ccsid=mqlogin.read_u32_ordered(reply, base + 28, swap),
             format_name=mqlogin.decode_mq_field(reply[base + 32 : base + 40], ccsid),
             message_id=reply[base + 48 : base + 72],
+            correlation_id=reply[base + 72 : base + 96],
         )
     except Exception as exc:
         return BrowseResult(2, 2195, error_text=str(exc))
@@ -1039,6 +1152,36 @@ def browse_queue(
             close_object(session_sock, handle, swap, ccsid)
         except (OSError, ValueError):
             pass
+
+
+def debug_browse_unmatched_pcf_reply(
+    session_sock: object, reply_queue_name: str, swap: bool, ccsid: int, fap_level: int
+) -> None:
+    """Browse one reply-queue message after a correlated PCF GET timed out.
+
+    This is diagnostic-only and uses MQGMO_BROWSE_FIRST, so it does not remove
+    a reply. It can distinguish an empty reply queue from a reply whose
+    CorrelId differs from the request CorrelId.
+    """
+    result = browse_queue(session_sock, reply_queue_name, 1024, swap, ccsid, fap_level)
+    if result.error_text:
+        print(f"[debug] PCF unmatched-reply browse failed: {result.error_text}", file=sys.stderr)
+    elif result.reason_code == 2033:
+        print("[debug] PCF unmatched-reply browse: queue empty", file=sys.stderr)
+    elif result.comp_code == 2:
+        print(
+            f"[debug] PCF unmatched-reply browse failed: mqcc={result.comp_code} mqrc={result.reason_code}",
+            file=sys.stderr,
+        )
+    else:
+        print(
+            "[debug] PCF unmatched-reply browse: "
+            f"mqcc={result.comp_code} mqrc={result.reason_code} data_length={result.data_length} "
+            f"ccsid={result.ccsid} format={result.format_name!r} "
+            f"msg_id={result.message_id.hex() if result.message_id else 'n/a'} "
+            f"correl_id={result.correlation_id.hex() if result.correlation_id else 'n/a'}",
+            file=sys.stderr,
+        )
 
 
 def browse_queue_messages(
