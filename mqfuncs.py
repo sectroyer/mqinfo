@@ -1,14 +1,22 @@
 #!/usr/bin/env python3
 
-"""Authenticate to IBM MQ and list SPI functions available on the session."""
+"""Authenticated IBM MQ diagnostics using the raw RFP protocol.
+
+Provides SPI capability discovery, read-only PCF inquiries, optional
+dead-letter-queue inspection, and MQSC diagnostics.
+"""
 
 import argparse
 import getpass
 import os
+import struct
 import sys
 from dataclasses import dataclass
 
 import mqlogin
+# IBM MQ protocol constants (segment types, structure sizes/offsets,
+# option flags, attribute selectors, MQDLH layout).
+from mqrc_codes import *  # noqa: F403
 
 
 SCRIPT_VERSION = "0.1.0"
@@ -16,8 +24,6 @@ BANNER_TITLE = "IBM MQ Functions Tool"
 BANNER_CREDIT = "by Michał Majchrowicz AFINE Team"
 BANNER_LINE = f"{BANNER_TITLE} v{SCRIPT_VERSION} {BANNER_CREDIT}"
 
-RFP_TST_API_CALL = 140
-RFP_TST_API_REPLY = 156
 SPI_QUERY_VERB_ID = 1
 SPI_QUERY_VERB_VERSION = 1
 SPI_INSPI_SIZE = 12
@@ -40,81 +46,25 @@ SPI_VERB_NAMES = {
 }
 
 # Raw MQI flow types and a deliberately small set of read-only inquiry values.
-RFP_TST_MQOPEN = 131
-RFP_TST_MQCLOSE = 132
-RFP_TST_MQINQ = 137
-RFP_TST_MQOPEN_REPLY = 147
-RFP_TST_MQCLOSE_REPLY = 148
-RFP_TST_MQINQ_REPLY = 153
-RFP_TST_MQGET = 133
-RFP_TST_MQGET_REPLY = 149
-RFP_TST_MQPUT = 134
-RFP_TST_MQPUT_REPLY = 150
-MQOD_V1_SIZE = 168
-MQOPEN_PRIV_V1_SIZE = 28
-MQOO_INQUIRE = 0x00000020
-MQOO_BROWSE = 0x00000008
-MQOO_INPUT_SHARED = 0x00000002
-MQOO_INPUT_EXCLUSIVE = 0x00000004
-MQOO_OUTPUT = 0x00000010
-MQOO_FAIL_IF_QUIESCING = 0x00002000
-MQCO_NONE = 0
-MQOT_Q = 1
-MQOT_Q_MGR = 5
-MQGMO_BROWSE_FIRST = 0x00000010
-MQGMO_BROWSE_NEXT = 0x00000020
-MQGMO_ACCEPT_TRUNCATED_MSG = 0x00000040
-MQMD_V1_SIZE = 324
-MQMD_V2_SIZE = 364
-MQGMO_V1_SIZE = 72
-MQGMO_V2_SIZE = 80
-MQGMO_WAIT = 0x00000001
-MQGMO_FAIL_IF_QUIESCING = 0x00002000
-MQGMO_CONVERT = 0x00004000
-MQMO_MATCH_CORREL_ID = 0x00000002
-MQPMO_V1_SIZE = 128
-MQPMO_V2_SIZE = 152
-MQPMO_NO_SYNCPOINT = 0x00000004
-MQPMO_NEW_MSG_ID = 0x00000040
-MQPMO_FAIL_IF_QUIESCING = 0x00002000
-MQMD_MSG_ID_OFFSET = 48
-MQMD_CORREL_ID_OFFSET = 72
-MQMD_REPLY_TO_Q_OFFSET = 100
-MQMD_REPLY_TO_Q_MGR_OFFSET = 148
-MQMD_FORMAT_OFFSET = 32
-MQMD_MSG_TYPE_OFFSET = 12
-MQMD_REPORT_OFFSET = 8
-MQMD_EXPIRY_OFFSET = 16
-MQMD_ENCODING_OFFSET = 24
-MQMD_PRIORITY_OFFSET = 40
-MQMD_PERSISTENCE_OFFSET = 44
-MQMD_ID_SIZE = 24
 PCF_REPLY_MODEL_QUEUE = "SYSTEM.DEFAULT.MODEL.QUEUE"
+# On z/OS the command server replies to a queue derived from the command
+# reply model. SYSTEM.DEFAULT.MODEL.QUEUE is normally DEFTYPE(TEMPDYN),
+# which is not a suitable reply target for the command server's address
+# space, so the command reply model is preferred on that platform.
+PCF_REPLY_MODEL_QUEUE_ZOS = "SYSTEM.COMMAND.REPLY.MODEL"
 PCF_COMMAND_QUEUE = "SYSTEM.ADMIN.COMMAND.QUEUE"
-MQMT_REQUEST = 1
-MQRO_PASS_CORREL_ID = 64
 PCF_REQUEST_EXPIRY = 300
-MQENC_NATIVE = 273
-MQPRI_AS_Q_DEF = -1
-MQPER_PERSISTENCE_AS_Q_DEF = 2
-MQPER_NOT_PERSISTENT = 0
-MQPMO_NEW_CORREL_ID = 0x00000080
-MQIA_CODED_CHAR_SET_ID = 2
-MQIA_MAX_MSG_LENGTH = 13
-MQIA_MAX_PRIORITY = 14
-MQIA_COMMAND_LEVEL = 31
-MQIA_PLATFORM = 32
-MQCA_Q_MGR_NAME = 2015
-MQIA_CURRENT_Q_DEPTH = 3
-MQIA_DEF_PERSISTENCE = 5
-MQIA_INHIBIT_GET = 9
-MQIA_INHIBIT_PUT = 10
-MQIA_MAX_Q_DEPTH = 15
-MQIA_OPEN_INPUT_COUNT = 17
-MQIA_OPEN_OUTPUT_COUNT = 18
-MQIA_Q_TYPE = 20
-MQCA_BASE_Q_NAME = 2002
-MQCA_Q_NAME = 2016
+# Longer expiry (5 min) for requests whose replies may need to be collected
+# from the dead-letter queue instead of the reply queue. See
+# recover_pcf_replies_via_dlq for when that applies.
+PCF_DLQ_RECOVERY_EXPIRY = 3000
+QMGR_EVENT_QUEUE = "SYSTEM.ADMIN.QMGR.EVENT"
+MQCMD_ESCAPE = 38
+MQIACF_ESCAPE_TYPE = 1017
+MQCACF_ESCAPE_TEXT = 3014
+MQET_MQSC = 1
+# MQDLH (dead-letter header) layout, big-endian. The original undelivered
+# message follows immediately at MQDLH_SIZE.
 PCF_QUEUE_LIST_SELECTORS = (
     MQCA_Q_NAME,
     MQIA_CURRENT_Q_DEPTH,
@@ -128,32 +78,6 @@ QMGR_INFO_SELECTORS = (
     ("command_level", MQIA_COMMAND_LEVEL),
     ("platform", MQIA_PLATFORM),
 )
-MQ_PLATFORM_NAMES = {
-    1: "z/OS (MVS/OS390)",
-    2: "OS/2",
-    3: "AIX/UNIX",
-    4: "IBM i (OS/400)",
-    5: "Windows",
-    11: "Windows NT",
-    12: "OpenVMS",
-    13: "NonStop (NSK/NSS)",
-    15: "Open TP1",
-    18: "z/VM",
-    23: "z/TPF",
-    27: "z/VSE",
-    28: "IBM MQ Appliance",
-}
-MQ_CCSID_NAMES = {
-    37: "EBCDIC US/Canada",
-    500: "EBCDIC International",
-    819: "ISO-8859-1 (Latin-1)",
-    870: "EBCDIC Multilingual Latin-2",
-    1200: "UTF-16",
-    1208: "UTF-8",
-}
-MQ_QUEUE_TYPE_NAMES = {1: "local", 2: "model", 3: "alias", 6: "remote"}
-MQ_PERSISTENCE_NAMES = {0: "not persistent", 1: "persistent", 2: "as queue default"}
-MQ_INHIBIT_NAMES = {0: "allowed", 1: "inhibited"}
 
 
 class BannerArgumentParser(argparse.ArgumentParser):
@@ -235,6 +159,7 @@ class PcfQueueListResult:
     comp_code: int
     reason_code: int
     error_text: str | None = None
+    reply_queue_name: str | None = None
 
 
 @dataclass
@@ -243,6 +168,18 @@ class PcfQmgrProbeResult:
     comp_code: int
     reason_code: int
     error_text: str | None = None
+    reply_queue_name: str | None = None
+
+
+@dataclass(frozen=True)
+class DeadLetterRecord:
+    """One browsed dead-letter message: its DLH fields and the original payload."""
+    reason_code: int
+    dest_queue: str
+    dest_qmgr: str
+    ccsid: int
+    format_name: str
+    payload: bytes
 
 
 @dataclass
@@ -254,8 +191,20 @@ class BrowseResult:
     ccsid: int | None = None
     format_name: str | None = None
     message_id: bytes | None = None
-    correlation_id: bytes | None = None
     error_text: str | None = None
+
+
+class SessionError(RuntimeError):
+    """Attach the failing protocol stage to a session setup error."""
+
+    def __init__(self, stage: str, message: str) -> None:
+        super().__init__(message)
+        self.stage = stage
+
+
+def mqenc_native(swap: bool) -> int:
+    """Return MQENC_NATIVE for the queue manager's negotiated byte order."""
+    return 546 if swap else MQENC_NATIVE
 
 
 def format_spi_verb(verb: SpiVerb) -> str:
@@ -438,14 +387,20 @@ def build_mqopen_packet(
     return _build_mqi_packet(RFP_TST_MQOPEN, 0, body, swap, ccsid)
 
 
-def build_dynamic_reply_mqopen_packet(swap: bool, ccsid: int, fap_level: int) -> bytes:
-    """Build an MQOPEN for a transient dynamic PCF reply queue.
+def build_dynamic_reply_mqopen_packet(
+    swap: bool,
+    ccsid: int,
+    fap_level: int,
+    model_queue: str = PCF_REPLY_MODEL_QUEUE,
+    dynamic_prefix: str = "AMQ.PCF.*",
+) -> bytes:
+    """Build an MQOPEN for a dynamic PCF reply queue.
 
-    The queue manager derives a unique name from the model queue and the
-    `AMQ.PCF.*` prefix.  This helper only constructs bytes; it performs no I/O.
+    The queue manager derives a unique name from ``model_queue`` and
+    ``dynamic_prefix``.  This helper only constructs bytes; it performs no I/O.
     """
     return build_mqopen_packet(
-        PCF_REPLY_MODEL_QUEUE,
+        model_queue,
         MQOT_Q,
         swap,
         ccsid,
@@ -453,7 +408,7 @@ def build_dynamic_reply_mqopen_packet(swap: bool, ccsid: int, fap_level: int) ->
         # PCFAgent uses an exclusive input handle for its private reply queue
         # (8196). This prevents another consumer from stealing a reply.
         MQOO_INPUT_EXCLUSIVE | MQOO_FAIL_IF_QUIESCING,
-        "AMQ.PCF.*",
+        dynamic_prefix,
     )
 
 
@@ -488,15 +443,24 @@ def open_pcf_command_queue(
         return None, MqiInquireResult(2, 2195, error_text=str(exc))
 
 
-def open_dynamic_reply_queue(session_sock: object, swap: bool, ccsid: int, fap_level: int) -> DynamicReplyQueue:
-    """Create/open a transient dynamic reply queue and return its resolved name.
+def open_dynamic_reply_queue(
+    session_sock: object,
+    swap: bool,
+    ccsid: int,
+    fap_level: int,
+    model_queue: str = PCF_REPLY_MODEL_QUEUE,
+    dynamic_prefix: str = "AMQ.PCF.*",
+) -> DynamicReplyQueue:
+    """Create/open a dynamic reply queue and return its resolved name.
 
     MQOPEN returns an MQOD in its reply; its ObjectName field contains the
     queue manager-generated dynamic name. The caller owns the returned handle
     and must close it when finished.
     """
     try:
-        session_sock.sendall(build_dynamic_reply_mqopen_packet(swap, ccsid, fap_level))
+        session_sock.sendall(
+            build_dynamic_reply_mqopen_packet(swap, ccsid, fap_level, model_queue, dynamic_prefix)
+        )
         reply = _recv_spanned_mqi_reply(session_sock)
         comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQOPEN_REPLY, swap)
         result = MqiInquireResult(comp_code, reason_code)
@@ -515,7 +479,40 @@ def open_dynamic_reply_queue(session_sock: object, swap: bool, ccsid: int, fap_l
         return DynamicReplyQueue(None, None, MqiInquireResult(2, 2195, error_text=str(exc)))
 
 
-def build_pcf_request_mqmd(reply_to_queue: str, ccsid: int, reply_to_qmgr: str = "", swap: bool = False) -> bytes:
+def open_pcf_reply_queue(
+    session_sock: object, swap: bool, ccsid: int, fap_level: int, platform: int | None, debug: bool = False
+) -> DynamicReplyQueue:
+    """Open a dynamic PCF reply queue using the model appropriate to the platform.
+
+    On z/OS (platform 1) the command server replies to a queue derived from
+    SYSTEM.COMMAND.REPLY.MODEL. SYSTEM.DEFAULT.MODEL.QUEUE is normally
+    DEFTYPE(TEMPDYN), which is not a usable reply target for the command
+    server's own address space, and a reply put there can be discarded
+    silently. Falls back to the default model if the z/OS model is
+    unavailable, so non-z/OS and unusual z/OS setups still work.
+    """
+    candidates: list[tuple[str, str]] = []
+    if platform == 1:
+        candidates.append((PCF_REPLY_MODEL_QUEUE_ZOS, "SYSTEM.COMMAND.REPLY.*"))
+    candidates.append((PCF_REPLY_MODEL_QUEUE, "AMQ.PCF.*"))
+
+    last = DynamicReplyQueue(None, None, MqiInquireResult(2, 2195, error_text="no reply model queue tried"))
+    for model_queue, dynamic_prefix in candidates:
+        reply_queue = open_dynamic_reply_queue(
+            session_sock, swap, ccsid, fap_level, model_queue, dynamic_prefix
+        )
+        if debug:
+            status = reply_queue.name if reply_queue.handle is not None else (
+                reply_queue.result.error_text or mqlogin.format_mqrc(reply_queue.result.reason_code)
+            )
+            print(f"[debug] reply-queue model {model_queue!r} -> {status}", file=sys.stderr)
+        if reply_queue.handle is not None:
+            return reply_queue
+        last = reply_queue
+    return last
+
+
+def build_pcf_request_mqmd(reply_to_queue: str, ccsid: int, reply_to_qmgr: str = "", swap: bool = False, expiry: int = PCF_REQUEST_EXPIRY) -> bytes:
     """Build an MQMD V1 for a PCF command request; no message is sent."""
     space = mqlogin.encode_mq_bytes(" ", ccsid)
     def field(value: str, length: int) -> bytes:
@@ -524,9 +521,9 @@ def build_pcf_request_mqmd(reply_to_queue: str, ccsid: int, reply_to_qmgr: str =
             raise ValueError("MQMD character field exceeds its fixed width")
         return raw.ljust(length, space)
 
-    # RemoteFAP's PCF request path uses its default MQMD V1. Keeping this
-    # descriptor V1 also avoids shifting MQPMO for servers that parse PCF
-    # MQPUT requests with the V1 fixed offset.
+    # RemoteFAP's PCF request path uses MQMD V1. Keeping this descriptor V1
+    # avoids shifting MQPMO for z/OS servers that parse PCF MQPUT requests
+    # with the V1 fixed offset rather than reading Version dynamically.
     md = bytearray(MQMD_V1_SIZE)
     md[0:4] = field("MD  ", 4)
     mqlogin.write_u32_ordered(md, 4, 1, swap)
@@ -536,29 +533,29 @@ def build_pcf_request_mqmd(reply_to_queue: str, ccsid: int, reply_to_qmgr: str =
     mqlogin.write_u32_ordered(md, MQMD_MSG_TYPE_OFFSET, MQMT_REQUEST, swap)
     # PCFAgent's default request expiry is 30 seconds, represented as 300
     # tenths of a second in MQMD.Expiry.
-    mqlogin.write_u32_ordered(md, MQMD_EXPIRY_OFFSET, PCF_REQUEST_EXPIRY, swap)
-    mqlogin.write_u32_ordered(md, MQMD_ENCODING_OFFSET, MQENC_NATIVE, swap)
+    mqlogin.write_u32_ordered(md, MQMD_EXPIRY_OFFSET, expiry, swap)
+    mqlogin.write_u32_ordered(md, MQMD_ENCODING_OFFSET, mqenc_native(swap), swap)
     mqlogin.write_u32_ordered(md, 28, ccsid, swap)
     md[MQMD_FORMAT_OFFSET : MQMD_FORMAT_OFFSET + 8] = field("MQADMIN", 8)
     mqlogin.write_u32_ordered(md, MQMD_PRIORITY_OFFSET, MQPRI_AS_Q_DEF & 0xFFFFFFFF, swap)
     mqlogin.write_u32_ordered(md, MQMD_PERSISTENCE_OFFSET, MQPER_NOT_PERSISTENT, swap)
     md[MQMD_REPLY_TO_Q_OFFSET : MQMD_REPLY_TO_Q_OFFSET + 48] = field(reply_to_queue, 48)
     md[MQMD_REPLY_TO_Q_MGR_OFFSET : MQMD_REPLY_TO_Q_MGR_OFFSET + 48] = field(reply_to_qmgr, 48)
-    # z/OS validates the MQ character fields as blank when client supplied.
-    # Keep binary fields (AccountingToken and PutApplType) at their zero defaults.
+    # z/OS validates character fields as blank; binary fields (AccountingToken,
+    # PutApplType) remain at their zero defaults.
     for off, size in ((196, 12), (240, 32), (276, 28), (304, 8), (312, 8), (320, 4)):
         md[off : off + size] = space * size
     return bytes(md)
 
 
-def build_pcf_inquire_q_mqmd(reply_queue: DynamicReplyQueue, ccsid: int, swap: bool) -> bytes:
+def build_pcf_inquire_q_mqmd(reply_queue: DynamicReplyQueue, ccsid: int, swap: bool, reply_to_qmgr: str = "", expiry: int = PCF_REQUEST_EXPIRY) -> bytes:
     """Build the PCF request MQMD using a live dynamic reply-queue context."""
     if reply_queue.handle is None or not reply_queue.name:
         raise ValueError("a successfully opened dynamic reply queue is required")
-    return build_pcf_request_mqmd(reply_queue.name, ccsid, swap=swap)
+    return build_pcf_request_mqmd(reply_queue.name, ccsid, reply_to_qmgr=reply_to_qmgr, swap=swap, expiry=expiry)
 
 
-def build_mqput_packet(handle: int, mqmd: bytes, message: bytes, swap: bool, ccsid: int) -> bytes:
+def build_mqput_packet(handle: int, mqmd: bytes, message: bytes, swap: bool, ccsid: int, fap_level: int = 9) -> bytes:
     """Build an MQPUT request for a non-persistent PCF command message.
 
     This function only serializes a packet. Callers must not send it until the
@@ -566,24 +563,28 @@ def build_mqput_packet(handle: int, mqmd: bytes, message: bytes, swap: bool, ccs
     """
     if len(mqmd) not in (MQMD_V1_SIZE, MQMD_V2_SIZE):
         raise ValueError("MQPUT requires an MQMD V1 or V2 structure")
-    pmo = bytearray(MQPMO_V2_SIZE)
+    pmo = bytearray(MQPMO_V1_SIZE)
     pmo[0:4] = mqlogin.encode_mq_bytes("PMO ", ccsid)
-    mqlogin.write_u32_ordered(pmo, 4, 2, swap)
-    # IBM's PCF agent asks the queue manager to assign a CorrelId, then uses
-    # that resulting value to retrieve all PCF replies from its dynamic queue.
-    mqlogin.write_u32_ordered(pmo, 8, MQPMO_NEW_CORREL_ID, swap)
+    mqlogin.write_u32_ordered(pmo, 4, 1, swap)
+    # NO_SYNCPOINT avoids RRS unit-of-work setup on z/OS.
+    # NEW_CORREL_ID asks the QMgr to generate a CorrelId we can match on MQGET.
+    mqlogin.write_u32_ordered(pmo, 8, MQPMO_NO_SYNCPOINT | MQPMO_NEW_CORREL_ID | MQPMO_FAIL_IF_QUIESCING, swap)
     space = mqlogin.encode_mq_bytes(" ", ccsid)
     pmo[32:80] = space * 48
     pmo[80:128] = space * 48
 
     fixed_body = mqmd + bytes(pmo) + len(message).to_bytes(4, "little" if swap else "big")
-    # RemoteFAP's CallLength includes both the serialized request and message user data.
+    # RemoteFAP CallLength includes the serialized structures AND the message data.
+    # z/OS uses this value to determine how many bytes constitute the full MQPUT call.
     call_length = mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE + len(fixed_body) + len(message)
+
     api_header = bytearray(mqlogin.MQAPI_HEADER_SIZE)
     mqlogin.write_u32(api_header, 0, call_length)
     mqlogin.write_u32_ordered(api_header, 12, handle, swap)
-    payload = bytes(api_header) + fixed_body + message
-    return mqlogin.build_tsh(RFP_TST_MQPUT, len(payload), mqlogin.RFP_TCF_FIRST | mqlogin.RFP_TCF_LAST, ccsid) + payload
+
+    full_payload = bytes(api_header) + fixed_body + message
+    tsh = mqlogin.build_tsh(RFP_TST_MQPUT, len(full_payload), mqlogin.RFP_TCF_FIRST | mqlogin.RFP_TCF_LAST, ccsid)
+    return tsh + full_payload
 
 
 def put_pcf_command(
@@ -594,6 +595,7 @@ def put_pcf_command(
     swap: bool,
     ccsid: int,
     debug: bool = False,
+    fap_level: int = 9,
 ) -> MqiPutResult:
     """Send one PCF command message and return its assigned correlation ID."""
     try:
@@ -618,11 +620,41 @@ def put_pcf_command(
                 f"reply_to_q={reply_to_q!r} reply_to_qmgr={reply_to_qmgr!r}",
                 file=sys.stderr,
             )
-        session_sock.sendall(build_mqput_packet(command_handle, mqmd, pcf_message, swap, ccsid))
-        reply = _recv_spanned_mqi_reply(session_sock)
+        mqput_packet = build_mqput_packet(command_handle, mqmd, pcf_message, swap, ccsid, fap_level)
+        if debug:
+            tsh_len = int.from_bytes(mqput_packet[4:8], "big")
+            call_len = int.from_bytes(mqput_packet[mqlogin.TSH_HEADER_SIZE:mqlogin.TSH_HEADER_SIZE + 4], "big")
+            pmo_base = mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE + len(mqmd)
+            pmo_version = mqlogin.read_u32_ordered(mqput_packet, pmo_base + 4, swap)
+            pmo_options = mqlogin.read_u32_ordered(mqput_packet, pmo_base + 8, swap)
+            pmo_size = MQPMO_V2_SIZE if pmo_version == 2 else MQPMO_V1_SIZE
+            print(
+                f"[debug] MQPUT packet: total={len(mqput_packet)} tsh_len={tsh_len} call_len={call_len} "
+                f"pmo_version={pmo_version} pmo_size={pmo_size} pmo_options=0x{pmo_options:08x} pcf_hex={pcf_message.hex()}",
+                file=sys.stderr,
+            )
+            print(f"[debug] MQPUT full packet hex: {mqput_packet.hex()}", file=sys.stderr)
+        session_sock.sendall(mqput_packet)
+        try:
+            reply = _recv_spanned_mqi_reply(session_sock)
+        except Exception as recv_exc:
+            if debug:
+                print(f"[debug] MQPUT recv failed: {recv_exc!r}", file=sys.stderr)
+                try:
+                    session_sock.settimeout(1.0)
+                    leftover = session_sock.recv(4096)
+                    print(f"[debug] MQPUT socket leftover: {leftover.hex() if leftover else '(empty)'}", file=sys.stderr)
+                except Exception as le:
+                    print(f"[debug] MQPUT no leftover: {le!r}", file=sys.stderr)
+            raise
         comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQPUT_REPLY, swap)
         if debug:
-            print(f"[debug] PCF MQPUT reply: mqcc={comp_code} mqrc={reason_code}", file=sys.stderr)
+            print(
+                f"[debug] PCF MQPUT reply: mqcc={mqlogin.format_mqcc(comp_code)} mqrc={mqlogin.format_mqrc(reason_code)}",
+                file=sys.stderr,
+            )
+            if comp_code == 2:
+                print(f"[debug] PCF MQPUT reply raw: {reply.hex()}", file=sys.stderr)
         if comp_code == 2:
             return MqiPutResult(comp_code, reason_code)
         md_offset = mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE
@@ -634,7 +666,12 @@ def put_pcf_command(
             correlation_id=reply[md_offset + MQMD_CORREL_ID_OFFSET : md_offset + MQMD_CORREL_ID_OFFSET + MQMD_ID_SIZE],
         )
         if debug:
-            print(f"[debug] PCF request CorrelId={result.correlation_id.hex()}", file=sys.stderr)
+            all_zero = not any(result.correlation_id)
+            print(
+                f"[debug] PCF request CorrelId={result.correlation_id.hex()}"
+                + (" (WARNING: all-zero CorrelId — MQGET will never match)" if all_zero else ""),
+                file=sys.stderr,
+            )
         return result
     except Exception as exc:
         return MqiPutResult(2, 2195, error_text=str(exc))
@@ -732,6 +769,211 @@ def inquire_queue(session_sock: object, object_name: str, swap: bool, ccsid: int
     finally:
         # A failed MQINQ can cause the queue manager to close the socket. Do
         # not hide the inquiry result with a secondary best-effort close error.
+        try:
+            close_object(session_sock, handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
+
+
+def parse_dead_letter_message(data: bytes, ccsid: int) -> DeadLetterRecord | None:
+    """Split a browsed MQDEAD message into its DLH fields and original payload.
+
+    Returns None when the buffer does not start with a DLH eyecatcher.
+    """
+    if len(data) < MQDLH_SIZE or data[0:4] not in (b"DLH ", mqlogin.encode_mq_bytes("DLH ", ccsid)):
+        return None
+    return DeadLetterRecord(
+        reason_code=int.from_bytes(data[MQDLH_REASON_OFFSET : MQDLH_REASON_OFFSET + 4], "big"),
+        dest_queue=mqlogin.decode_mq_field(data[MQDLH_DEST_Q_NAME_OFFSET : MQDLH_DEST_Q_NAME_OFFSET + 48], ccsid),
+        dest_qmgr=mqlogin.decode_mq_field(data[MQDLH_DEST_Q_MGR_OFFSET : MQDLH_DEST_Q_MGR_OFFSET + 48], ccsid),
+        ccsid=int.from_bytes(data[MQDLH_CCSID_OFFSET : MQDLH_CCSID_OFFSET + 4], "big"),
+        format_name=mqlogin.decode_mq_field(data[MQDLH_FORMAT_OFFSET : MQDLH_FORMAT_OFFSET + 8], ccsid),
+        payload=data[MQDLH_SIZE:],
+    )
+
+
+def recover_pcf_replies_via_dlq(
+    session_sock: object,
+    reply_queue_name: str,
+    swap: bool,
+    ccsid: int,
+    fap_level: int,
+    debug: bool = False,
+) -> list[object]:
+    """Resolve the DLQ and pull back any PCF replies addressed to one queue."""
+    dlq_name, _ = inquire_dead_letter_queue_name(session_sock, swap, ccsid, fap_level)
+    if not dlq_name:
+        return []
+    pairs = recover_dead_lettered_pcf_pairs(
+        session_sock, dlq_name, {reply_queue_name}, swap, ccsid, fap_level, debug=debug
+    )
+    if debug:
+        print(
+            f"[debug] DLQ fallback for {reply_queue_name}: {len(pairs)} reply/replies",
+            file=sys.stderr,
+        )
+    return [response for _, response in pairs if response is not None]
+
+
+def recover_dead_lettered_pcf_pairs(
+    session_sock: object,
+    dlq_name: str,
+    reply_queue_names: set[str],
+    swap: bool,
+    ccsid: int,
+    fap_level: int,
+    max_messages: int = 200,
+    max_bytes: int = 4096,
+    debug: bool = False,
+) -> list[tuple[DeadLetterRecord, object | None]]:
+    """Recover dead-lettered PCF replies as (dlh_record, parsed_response) pairs.
+
+    Pairing matters: a single command can produce several replies (a detail
+    response carrying the real reason, then a summary response), and a payload
+    that fails to parse must not shift the alignment of everything after it.
+    Callers that need to attribute a reason to a specific request must use
+    these pairs rather than two parallel lists.
+    """
+    import mqpcf
+
+    pairs: list[tuple[DeadLetterRecord, object | None]] = []
+    for browse in browse_queue_messages(
+        session_sock, dlq_name, max_bytes, max_messages, swap, ccsid, fap_level
+    ):
+        if browse.error_text or browse.comp_code == 2 or not browse.data:
+            continue
+        record = parse_dead_letter_message(browse.data, ccsid)
+        if record is None or (reply_queue_names and record.dest_queue not in reply_queue_names):
+            continue
+        try:
+            pairs.append((record, mqpcf.parse_response(record.payload)))
+        except Exception as exc:
+            if debug:
+                print(
+                    f"[debug] DLQ reply for {record.dest_queue} not parseable as PCF: {exc}",
+                    file=sys.stderr,
+                )
+            pairs.append((record, None))
+    return pairs
+
+
+def recover_dead_lettered_pcf_replies(
+    session_sock: object,
+    dlq_name: str,
+    reply_queue_names: set[str],
+    swap: bool,
+    ccsid: int,
+    fap_level: int,
+    max_messages: int = 200,
+    max_bytes: int = 4096,
+    debug: bool = False,
+) -> tuple[list[object], list[DeadLetterRecord]]:
+    """Browse the dead-letter queue and recover PCF replies addressed to us.
+
+    A command server reply is not always deliverable to the requester's reply
+    queue -- the queue may be full, put-inhibited, or refused for the
+    requesting identity. In those cases the queue manager routes the reply to
+    the dead-letter queue instead, where the original message survives intact
+    behind the MQDLH. This reads such replies back from the DLQ.
+
+    Browsing only; nothing is consumed.
+    """
+    pairs = recover_dead_lettered_pcf_pairs(
+        session_sock, dlq_name, reply_queue_names, swap, ccsid, fap_level,
+        max_messages, max_bytes, debug,
+    )
+    matched = [record for record, _ in pairs]
+    parsed = [response for _, response in pairs if response is not None]
+    if debug:
+        print(
+            f"[debug] DLQ recovery: matched={len(matched)} parsed={len(parsed)}",
+            file=sys.stderr,
+        )
+    return parsed, matched
+
+
+def enumerate_dead_letter_queue(
+    session_sock: object,
+    dlq_name: str,
+    swap: bool,
+    ccsid: int,
+    fap_level: int,
+    max_messages: int = 200,
+    max_bytes: int = 4096,
+) -> tuple[list[DeadLetterRecord], list[BrowseResult]]:
+    """Browse the whole dead-letter queue and decode every DLH.
+
+    Read-only (MQOO_BROWSE); nothing is consumed. The DLH DestQName fields
+    are a queue-name discovery channel that does not depend on PCF being
+    authorized, and the payloads show what data is exposed to a client that
+    can browse the DLQ.
+    """
+    records: list[DeadLetterRecord] = []
+    others: list[BrowseResult] = []
+    for browse in browse_queue_messages(
+        session_sock, dlq_name, max_bytes, max_messages, swap, ccsid, fap_level
+    ):
+        if browse.error_text or browse.comp_code == 2 or not browse.data:
+            continue
+        record = parse_dead_letter_message(browse.data, ccsid)
+        if record is None:
+            others.append(browse)
+        else:
+            records.append(record)
+    return records, others
+
+
+def summarize_dead_letter_queue(records: list[DeadLetterRecord]) -> dict[str, dict[str, int]]:
+    """Group dead-letter records by destination queue and DLH reason."""
+    summary: dict[str, dict[str, int]] = {}
+    for record in records:
+        by_reason = summary.setdefault(record.dest_queue, {})
+        key = mqlogin.format_mqrc(record.reason_code)
+        by_reason[key] = by_reason.get(key, 0) + 1
+    return summary
+
+
+def inquire_dead_letter_queue_name(
+    session_sock: object, swap: bool, ccsid: int, fap_level: int
+) -> tuple[str, MqiInquireResult]:
+    """Read-only MQINQ for the queue manager's dead-letter queue name."""
+    handle, open_result = open_for_inquire(session_sock, None, MQOT_Q_MGR, swap, ccsid, fap_level)
+    if handle is None:
+        return "", open_result
+    try:
+        result = inquire(session_sock, handle, [MQCA_DEAD_LETTER_Q_NAME], 48, swap, ccsid)
+        if result.error_text or result.comp_code == 2:
+            return "", result
+        return mqlogin.decode_mq_field(result.char_attributes, ccsid), result
+    finally:
+        try:
+            close_object(session_sock, handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
+
+
+def inquire_model_queue(
+    session_sock: object, object_name: str, swap: bool, ccsid: int, fap_level: int
+) -> tuple[dict[str, int | str], MqiInquireResult]:
+    """Read-only MQINQ of a model queue's definition type and queue type.
+
+    Used to confirm whether a reply model queue is TEMPDYN or PERMDYN, which
+    determines whether the z/OS command server can use queues derived from it
+    as a reply target.
+    """
+    handle, open_result = open_for_inquire(session_sock, object_name, MQOT_Q, swap, ccsid, fap_level)
+    if handle is None:
+        return {}, open_result
+    try:
+        result = inquire(session_sock, handle, [MQIA_Q_TYPE, MQIA_DEFINITION_TYPE, MQCA_Q_NAME], 48, swap, ccsid)
+        if result.error_text or result.comp_code == 2 or result.int_attributes is None:
+            return {}, result
+        return {
+            "queue_type": result.int_attributes[0],
+            "definition_type": result.int_attributes[1],
+            "queue_name": mqlogin.decode_mq_field(result.char_attributes, ccsid),
+        }, result
+    finally:
         try:
             close_object(session_sock, handle, swap, ccsid)
         except (OSError, ValueError):
@@ -868,6 +1110,152 @@ def build_pcf_reply_mqget_packet(
     return _build_mqi_packet(RFP_TST_MQGET, handle, body, swap, ccsid, max_bytes)
 
 
+def build_any_message_mqget_packet(
+    handle: int,
+    max_bytes: int,
+    swap: bool,
+    ccsid: int,
+    wait_interval_ms: int = 2000,
+) -> bytes:
+    """Build an uncorrelated MQGET that accepts any message on the queue.
+
+    Diagnostic only: used to check whether a PCF reply queue is truly empty
+    or holds a message whose CorrelId did not match what we expected.
+    """
+    if not 1 <= max_bytes <= 1024 * 1024:
+        raise ValueError("reply byte limit must be between 1 and 1048576")
+    md = bytearray(MQMD_V1_SIZE)
+    md[0:4] = mqlogin.encode_mq_bytes("MD  ", ccsid)
+    mqlogin.write_u32_ordered(md, 4, 1, swap)
+    gmo = bytearray(MQGMO_V2_SIZE)
+    gmo[0:4] = mqlogin.encode_mq_bytes("GMO ", ccsid)
+    mqlogin.write_u32_ordered(gmo, 4, 2, swap)
+    mqlogin.write_u32_ordered(gmo, 8, MQGMO_WAIT | MQGMO_FAIL_IF_QUIESCING | MQGMO_CONVERT | MQGMO_ACCEPT_TRUNCATED_MSG, swap)
+    mqlogin.write_u32_ordered(gmo, 12, wait_interval_ms, swap)
+    body = md + gmo + max_bytes.to_bytes(4, "little" if swap else "big")
+    return _build_mqi_packet(RFP_TST_MQGET, handle, body, swap, ccsid, max_bytes)
+
+
+def probe_any_message(
+    session_sock: object,
+    reply_handle: int,
+    max_bytes: int,
+    swap: bool,
+    ccsid: int,
+    wait_interval_ms: int = 2000,
+) -> MqiInquireResult:
+    """Diagnostic: attempt an uncorrelated MQGET to see if anything at all is queued.
+
+    This destructively consumes a message if one is present. It exists only to
+    distinguish "reply queue truly empty" (server never replied) from
+    "a reply exists but its CorrelId did not match" (our own bug).
+    """
+    try:
+        session_sock.sendall(build_any_message_mqget_packet(reply_handle, max_bytes, swap, ccsid, wait_interval_ms))
+        reply = _recv_spanned_mqi_reply(session_sock)
+        comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQGET_REPLY, swap)
+        if comp_code == 2:
+            return MqiInquireResult(comp_code, reason_code)
+        base = mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE
+        data_offset = base + MQMD_V1_SIZE + MQGMO_V2_SIZE
+        if len(reply) < data_offset + 4:
+            return MqiInquireResult(2, 2195, error_text="truncated uncorrelated MQGET reply")
+        found_correl_id = reply[base + MQMD_CORREL_ID_OFFSET : base + MQMD_CORREL_ID_OFFSET + MQMD_ID_SIZE]
+        data_length = mqlogin.read_u32_ordered(reply, data_offset, swap)
+        return MqiInquireResult(
+            comp_code,
+            reason_code,
+            error_text=f"found unmatched message: correl_id={found_correl_id.hex()} data_length={data_length}",
+        )
+    except Exception as exc:
+        return MqiInquireResult(2, 2195, error_text=str(exc))
+
+
+def build_self_test_mqmd(ccsid: int, swap: bool) -> bytes:
+    """Build a minimal, fully valid MQMD V1 for the self-test loopback message.
+
+    Unlike build_pcf_request_mqmd, this sets no Report options, so no
+    ReplyToQ is required (avoids MQRC_MISSING_REPLY_TO_Q) — the loopback test
+    already gets its own CorrelId via MQPMO_NEW_CORREL_ID on the PUT.
+    """
+    space = mqlogin.encode_mq_bytes(" ", ccsid)
+    def field(value: str, length: int) -> bytes:
+        return mqlogin.encode_mq_bytes(value, ccsid).ljust(length, space)
+
+    md = bytearray(MQMD_V1_SIZE)
+    md[0:4] = field("MD  ", 4)
+    mqlogin.write_u32_ordered(md, 4, 1, swap)
+    mqlogin.write_u32_ordered(md, MQMD_MSG_TYPE_OFFSET, MQMT_DATAGRAM, swap)
+    mqlogin.write_u32_ordered(md, MQMD_EXPIRY_OFFSET, PCF_REQUEST_EXPIRY, swap)
+    mqlogin.write_u32_ordered(md, MQMD_ENCODING_OFFSET, mqenc_native(swap), swap)
+    mqlogin.write_u32_ordered(md, 28, ccsid, swap)
+    md[MQMD_FORMAT_OFFSET : MQMD_FORMAT_OFFSET + 8] = field("MQSTR", 8)
+    mqlogin.write_u32_ordered(md, MQMD_PRIORITY_OFFSET, MQPRI_AS_Q_DEF & 0xFFFFFFFF, swap)
+    mqlogin.write_u32_ordered(md, MQMD_PERSISTENCE_OFFSET, MQPER_NOT_PERSISTENT, swap)
+    md[MQMD_REPLY_TO_Q_OFFSET : MQMD_REPLY_TO_Q_OFFSET + 48] = field("", 48)
+    md[MQMD_REPLY_TO_Q_MGR_OFFSET : MQMD_REPLY_TO_Q_MGR_OFFSET + 48] = field("", 48)
+    for off, size in ((196, 12), (240, 32), (276, 28), (304, 8), (312, 8), (320, 4)):
+        md[off : off + size] = space * size
+    return bytes(md)
+
+
+def self_test_loopback(
+    session_sock: object, swap: bool, ccsid: int, fap_level: int, wait_ms: int = 5000
+) -> MqiPutResult:
+    """Control test: PUT a plain message to a private dynamic queue and MQGET
+    it back by CorrelId, entirely independent of the PCF command server and
+    SYSTEM.ADMIN.COMMAND.QUEUE.
+
+    This isolates whether basic MQPUT/MQGET/correlation plumbing works on
+    this session at all, so a stuck PCF flow can be attributed to the command
+    server specifically rather than a general PUT/GET problem.
+    """
+    handle, open_result = open_for_inquire(
+        session_sock,
+        PCF_REPLY_MODEL_QUEUE,
+        MQOT_Q,
+        swap,
+        ccsid,
+        fap_level,
+        MQOO_INPUT_EXCLUSIVE | MQOO_OUTPUT | MQOO_FAIL_IF_QUIESCING,
+    )
+    if handle is None:
+        return MqiPutResult(
+            open_result.comp_code, open_result.reason_code,
+            error_text=open_result.error_text or "self-test dynamic MQOPEN failed",
+        )
+    try:
+        md = build_self_test_mqmd(ccsid, swap)
+        message = mqlogin.encode_mq_bytes("MQ-SELFTEST-MESSAGE", ccsid)
+        put_result = put_pcf_command(session_sock, handle, md, message, swap, ccsid, False, fap_level)
+        if put_result.comp_code == 2 or put_result.correlation_id is None:
+            return put_result
+        session_sock.sendall(
+            build_pcf_reply_mqget_packet(handle, put_result.correlation_id, 256, swap, ccsid, wait_ms)
+        )
+        reply = _recv_spanned_mqi_reply(session_sock)
+        comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQGET_REPLY, swap)
+        if comp_code == 2:
+            return MqiPutResult(comp_code, reason_code, correlation_id=put_result.correlation_id)
+        base = mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE
+        data_offset = base + MQMD_V1_SIZE + MQGMO_V2_SIZE
+        if len(reply) < data_offset + 4:
+            return MqiPutResult(2, 2195, error_text="truncated self-test MQGET reply")
+        data_length = mqlogin.read_u32_ordered(reply, data_offset, swap)
+        data = reply[data_offset + 4 : data_offset + 4 + data_length]
+        return MqiPutResult(
+            comp_code, reason_code, correlation_id=put_result.correlation_id,
+            error_text=f"round-trip succeeded: {data!r}",
+        )
+    except Exception as exc:
+        return MqiPutResult(2, 2195, error_text=str(exc))
+    finally:
+        try:
+            close_object(session_sock, handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
+
+
 def get_pcf_responses(
     session_sock: object,
     reply_handle: int,
@@ -899,7 +1287,10 @@ def get_pcf_responses(
             comp_code, reason_code = _parse_mqi_reply(reply, RFP_TST_MQGET_REPLY, swap)
             result = MqiInquireResult(comp_code, reason_code)
             if debug:
-                print(f"[debug] PCF MQGET reply: mqcc={comp_code} mqrc={reason_code}", file=sys.stderr)
+                print(
+                    f"[debug] PCF MQGET reply: mqcc={mqlogin.format_mqcc(comp_code)} mqrc={mqlogin.format_mqrc(reason_code)}",
+                    file=sys.stderr,
+                )
             if comp_code == 2:
                 return responses, result
             base = mqlogin.TSH_HEADER_SIZE + mqlogin.MQAPI_HEADER_SIZE
@@ -919,7 +1310,8 @@ def get_pcf_responses(
                 ]
                 print(
                     f"[debug] PCF response: bytes={data_length} correl_id={response_correlation_id.hex()} "
-                    f"pcf_mqcc={parsed.comp_code} pcf_mqrc={parsed.reason_code} last={parsed.is_last}",
+                    f"pcf_mqcc={mqlogin.format_mqcc(parsed.comp_code)} pcf_mqrc={mqlogin.format_mqrc(parsed.reason_code)} "
+                    f"last={parsed.is_last}",
                     file=sys.stderr,
                 )
             responses.append(parsed)
@@ -973,27 +1365,46 @@ def list_queues(
         return PcfQueueListResult([], qmgr_result.comp_code, qmgr_result.reason_code, qmgr_result.error_text or "queue-manager inquiry failed")
     pcf_header_type = 16 if qmgr_values.get("platform") == 1 else mqpcf.MQCFT_COMMAND
 
-    reply_queue = open_dynamic_reply_queue(session_sock, swap, ccsid, fap_level)
+    reply_queue = open_pcf_reply_queue(
+        session_sock, swap, ccsid, fap_level, qmgr_values.get("platform"), debug
+    )
     if reply_queue.handle is None:
         return PcfQueueListResult([], reply_queue.result.comp_code, reply_queue.result.reason_code, reply_queue.result.error_text or "temporary reply-queue MQOPEN failed")
     command_handle: int | None = None
+    # PCF command processing on z/OS is slow; bump socket timeout to cover the
+    # full GMO WaitInterval plus a small margin before entering the PCF phase.
+    _orig_timeout = session_sock.gettimeout()
+    session_sock.settimeout(reply_wait_seconds + 10)
     try:
         command_handle, open_result = open_pcf_command_queue(session_sock, swap, ccsid, fap_level)
         if command_handle is None:
             return PcfQueueListResult([], open_result.comp_code, open_result.reason_code, open_result.error_text or "command-queue MQOPEN failed")
-        md = build_pcf_inquire_q_mqmd(reply_queue, ccsid, swap)
-        request = mqpcf.build_inquire_q_request(pattern, list(selectors), pcf_header_type, ccsid)
+        md = build_pcf_inquire_q_mqmd(
+            reply_queue, ccsid, swap,
+            reply_to_qmgr=str(qmgr_values.get("queue_manager_name", "")),
+            # If the reply cannot be delivered to the reply queue it is
+            # dead-lettered instead, and the default 30s expiry would let it
+            # lapse before it could be collected. Keep it alive long enough
+            # for the DLQ fallback below.
+            expiry=PCF_DLQ_RECOVERY_EXPIRY,
+        )
+        # PCF string parameters must be tagged with the character set actually
+        # used to encode them. MQMD.CodedCharSetId advertises the queue
+        # manager's CCSID, so encode the pattern the same way rather than
+        # hardcoding UTF-8.
+        string_ccsid = ccsid if ccsid in (819, 870, 1208) else mqpcf.MQCCSI_UTF8
+        request = mqpcf.build_inquire_q_request(pattern, list(selectors), pcf_header_type, string_ccsid)
         if debug:
             print(
                 f"[debug] PCF queues: reply_queue={reply_queue.name} reply_hobj={reply_queue.handle} "
-                f"command_hobj={command_handle} header_type={pcf_header_type} string_ccsid={ccsid} "
+                f"command_hobj={command_handle} header_type={pcf_header_type} string_ccsid={string_ccsid} "
                 f"selectors={list(selectors)}",
                 file=sys.stderr,
             )
-        put_result = put_pcf_command(session_sock, command_handle, md, request, swap, ccsid, debug)
+        put_result = put_pcf_command(session_sock, command_handle, md, request, swap, ccsid, debug, fap_level)
         if put_result.comp_code == 2 or put_result.correlation_id is None:
             detail = put_result.error_text or mqlogin.format_mqrc(put_result.reason_code)
-            packet = build_mqput_packet(command_handle, md, request, swap, ccsid)
+            packet = build_mqput_packet(command_handle, md, request, swap, ccsid, fap_level)
             tsh_length = int.from_bytes(packet[4:8], "big")
             call_length = int.from_bytes(packet[mqlogin.TSH_HEADER_SIZE : mqlogin.TSH_HEADER_SIZE + 4], "big")
             return PcfQueueListResult(
@@ -1017,15 +1428,168 @@ def list_queues(
             debug,
         )
         if get_result.comp_code == 2:
-            if debug and get_result.reason_code == 2033:
-                debug_browse_unmatched_pcf_reply(session_sock, reply_queue.name, swap, ccsid, fap_level)
             detail = get_result.error_text or mqlogin.format_mqrc(get_result.reason_code)
-            return PcfQueueListResult([], get_result.comp_code, get_result.reason_code, f"correlated PCF MQGET failed: {detail}")
+            if debug and get_result.reason_code == 2033:
+                probe = probe_any_message(session_sock, reply_queue.handle, max_reply_bytes, swap, ccsid)
+                print(
+                    f"[debug] uncorrelated reply-queue probe: mqcc={mqlogin.format_mqcc(probe.comp_code)} "
+                    f"mqrc={mqlogin.format_mqrc(probe.reason_code)} {probe.error_text or ''}",
+                    file=sys.stderr,
+                )
+            # No reply arrived on the reply queue. If it was dead-lettered
+            # instead, it can still be recovered from the DLQ.
+            recovered = recover_pcf_replies_via_dlq(
+                session_sock, reply_queue.name, swap, ccsid, fap_level, debug
+            )
+            for response in recovered:
+                reason = getattr(response, "reason_code", 0)
+                if getattr(response, "comp_code", 0) == 2 and reason not in (0, 3008):
+                    return PcfQueueListResult(
+                        [], response.comp_code, reason,
+                        f"PCF Inquire Queue refused: {mqlogin.format_pcf_reason(reason)}",
+                        reply_queue_name=reply_queue.name,
+                    )
+            records = pcf_queue_records(recovered)
+            if records:
+                return PcfQueueListResult(records, 0, 0, reply_queue_name=reply_queue.name)
+            return PcfQueueListResult(
+                [], get_result.comp_code, get_result.reason_code,
+                f"correlated PCF MQGET failed: {detail}",
+                reply_queue_name=reply_queue.name,
+            )
         for response in responses:
             if getattr(response, "comp_code", 0) == 2:
                 return PcfQueueListResult([], response.comp_code, response.reason_code, "PCF Inquire Queue failed")
         return PcfQueueListResult(pcf_queue_records(responses), get_result.comp_code, get_result.reason_code)
     finally:
+        session_sock.settimeout(_orig_timeout)
+        if command_handle is not None:
+            try:
+                close_object(session_sock, command_handle, swap, ccsid)
+            except (OSError, ValueError):
+                pass
+        try:
+            close_object(session_sock, reply_queue.handle, swap, ccsid)
+        except (OSError, ValueError):
+            pass
+
+
+# MQSC verbs that only read state. The escape path hands raw MQSC to the
+# command server, so anything outside this set is refused by default.
+MQSC_READONLY_VERBS = ("DISPLAY", "DIS")
+
+
+def is_readonly_mqsc(command: str) -> bool:
+    """Return whether an MQSC command string is a read-only DISPLAY command."""
+    first = command.strip().split(None, 1)[0].upper() if command.strip() else ""
+    return first in MQSC_READONLY_VERBS
+
+
+def build_escape_request(mqsc_command: str, header_type: int, string_ccsid: int) -> bytes:
+    """Build an MQCMD_ESCAPE request carrying one MQSC command string."""
+    import mqpcf
+
+    codec = {819: "iso-8859-1", 870: "cp500", 1208: "utf-8"}.get(string_ccsid)
+    if codec is None:
+        raise ValueError(f"unsupported escape string CCSID {string_ccsid}")
+    if header_type not in (mqpcf.MQCFT_COMMAND, 16):
+        raise ValueError("unsupported PCF command header type")
+    text = mqsc_command.strip()
+    if not text:
+        raise ValueError("MQSC command text must not be empty")
+    encoded = text.encode(codec)
+    if len(encoded) > 32768:
+        raise ValueError("MQSC command text is too long")
+    padded = encoded + b"\x00" * ((-len(encoded)) % 4)
+
+    escape_type = struct.pack(
+        ">IIII", mqpcf.MQCFT_INTEGER, 16, MQIACF_ESCAPE_TYPE, MQET_MQSC
+    )
+    escape_text = struct.pack(
+        ">IIIII", mqpcf.MQCFT_STRING, 20 + len(padded), MQCACF_ESCAPE_TEXT, string_ccsid, len(encoded)
+    ) + padded
+    header = struct.pack(
+        ">IIIIIIIII", header_type, mqpcf.MQCFH_SIZE, 3, MQCMD_ESCAPE, 1, mqpcf.MQCFC_LAST, 0, 0, 2
+    )
+    return header + escape_type + escape_text
+
+
+def send_mqsc_escape(
+    session_sock: object,
+    mqsc_command: str,
+    swap: bool,
+    ccsid: int,
+    fap_level: int,
+    reply_wait_seconds: float = 15.0,
+    allow_unsafe: bool = False,
+    debug: bool = False,
+) -> PcfQmgrProbeResult:
+    """Send one MQSC command through the PCF escape path (MQCMD_ESCAPE).
+
+    The escape route is a different command path from native PCF and may be
+    authorized separately. Replies that the command server cannot deliver are
+    recovered from the dead-letter queue, as with native PCF.
+
+    Refuses anything that is not a DISPLAY command unless allow_unsafe is set,
+    because escape text is executed verbatim by the command server.
+    """
+    import mqpcf
+
+    if not allow_unsafe and not is_readonly_mqsc(mqsc_command):
+        return PcfQmgrProbeResult(
+            [], 2, 2195,
+            f"refused: {mqsc_command.strip()!r} is not a read-only DISPLAY command "
+            "(pass allow_unsafe=True to override)",
+        )
+
+    qmgr_values, qmgr_result = inquire_queue_manager(session_sock, swap, ccsid, fap_level)
+    if qmgr_result.error_text or qmgr_result.comp_code == 2:
+        return PcfQmgrProbeResult([], qmgr_result.comp_code, qmgr_result.reason_code, "queue-manager inquiry failed")
+    platform = qmgr_values.get("platform")
+    header_type = 16 if platform == 1 else mqpcf.MQCFT_COMMAND
+    string_ccsid = ccsid if ccsid in (819, 870, 1208) else mqpcf.MQCCSI_UTF8
+
+    reply_queue = open_pcf_reply_queue(session_sock, swap, ccsid, fap_level, platform, debug)
+    if reply_queue.handle is None:
+        return PcfQmgrProbeResult([], reply_queue.result.comp_code, reply_queue.result.reason_code, "reply-queue MQOPEN failed")
+    command_handle: int | None = None
+    _orig_timeout = session_sock.gettimeout()
+    session_sock.settimeout(reply_wait_seconds + 10)
+    try:
+        command_handle, open_result = open_pcf_command_queue(session_sock, swap, ccsid, fap_level)
+        if command_handle is None:
+            return PcfQmgrProbeResult([], open_result.comp_code, open_result.reason_code, "command-queue MQOPEN failed")
+        request = build_escape_request(mqsc_command, header_type, string_ccsid)
+        if debug:
+            print(
+                f"[debug] MQSC escape: {mqsc_command!r} reply_queue={reply_queue.name} "
+                f"header_type={header_type} string_ccsid={string_ccsid} pcf_bytes={len(request)}",
+                file=sys.stderr,
+            )
+        md = build_pcf_inquire_q_mqmd(
+            reply_queue, ccsid, swap, reply_to_qmgr=str(qmgr_values.get("queue_manager_name", ""))
+        )
+        put_result = put_pcf_command(session_sock, command_handle, md, request, swap, ccsid, debug, fap_level)
+        if put_result.comp_code == 2 or put_result.correlation_id is None:
+            return PcfQmgrProbeResult(
+                [], put_result.comp_code, put_result.reason_code,
+                put_result.error_text or "escape MQPUT failed",
+                reply_queue_name=reply_queue.name,
+            )
+        responses, get_result = get_pcf_responses(
+            session_sock, reply_queue.handle, put_result.correlation_id, 8192, swap, ccsid,
+            min(max(1, int(reply_wait_seconds * 1000)), 2_147_483_647), debug,
+        )
+        if responses:
+            return PcfQmgrProbeResult(responses, get_result.comp_code, get_result.reason_code,
+                                      reply_queue_name=reply_queue.name)
+        return PcfQmgrProbeResult(
+            [], get_result.comp_code, get_result.reason_code,
+            get_result.error_text or mqlogin.format_mqrc(get_result.reason_code),
+            reply_queue_name=reply_queue.name,
+        )
+    finally:
+        session_sock.settimeout(_orig_timeout)
         if command_handle is not None:
             try:
                 close_object(session_sock, command_handle, swap, ccsid)
@@ -1048,11 +1612,17 @@ def probe_queue_manager_pcf(
     qmgr_values, qmgr_result = inquire_queue_manager(session_sock, swap, ccsid, fap_level)
     if qmgr_result.error_text or qmgr_result.comp_code == 2:
         return PcfQmgrProbeResult([], qmgr_result.comp_code, qmgr_result.reason_code, qmgr_result.error_text or "queue-manager inquiry failed")
+    # z/OS expects MQCFT_COMMAND_XR (16) rather than MQCFT_COMMAND (1); the
+    # queue-list path already did this, so keep the probe consistent.
     header_type = 16 if qmgr_values.get("platform") == 1 else mqpcf.MQCFT_COMMAND
-    reply_queue = open_dynamic_reply_queue(session_sock, swap, ccsid, fap_level)
+    reply_queue = open_pcf_reply_queue(
+        session_sock, swap, ccsid, fap_level, qmgr_values.get("platform"), debug
+    )
     if reply_queue.handle is None:
         return PcfQmgrProbeResult([], reply_queue.result.comp_code, reply_queue.result.reason_code, reply_queue.result.error_text or "temporary reply-queue MQOPEN failed")
     command_handle: int | None = None
+    _orig_timeout = session_sock.gettimeout()
+    session_sock.settimeout(reply_wait_seconds + 10)
     try:
         command_handle, open_result = open_pcf_command_queue(session_sock, swap, ccsid, fap_level)
         if command_handle is None:
@@ -1065,8 +1635,8 @@ def probe_queue_manager_pcf(
                 f"command_hobj={command_handle} header_type={header_type} pcf_bytes={len(request)} selectors={selectors}",
                 file=sys.stderr,
             )
-        md = build_pcf_inquire_q_mqmd(reply_queue, ccsid, swap)
-        put_result = put_pcf_command(session_sock, command_handle, md, request, swap, ccsid, debug)
+        md = build_pcf_inquire_q_mqmd(reply_queue, ccsid, swap, reply_to_qmgr=str(qmgr_values.get("queue_manager_name", "")))
+        put_result = put_pcf_command(session_sock, command_handle, md, request, swap, ccsid, debug, fap_level)
         if put_result.comp_code == 2 or put_result.correlation_id is None:
             return PcfQmgrProbeResult([], put_result.comp_code, put_result.reason_code, put_result.error_text or "PCF probe MQPUT failed")
         responses, get_result = get_pcf_responses(
@@ -1081,13 +1651,22 @@ def probe_queue_manager_pcf(
         )
         if get_result.comp_code == 2:
             if debug and get_result.reason_code == 2033:
-                debug_browse_unmatched_pcf_reply(session_sock, reply_queue.name, swap, ccsid, fap_level)
-            return PcfQmgrProbeResult(responses, get_result.comp_code, get_result.reason_code, get_result.error_text)
+                probe = probe_any_message(session_sock, reply_queue.handle, 1024, swap, ccsid)
+                print(
+                    f"[debug] uncorrelated reply-queue probe: mqcc={mqlogin.format_mqcc(probe.comp_code)} "
+                    f"mqrc={mqlogin.format_mqrc(probe.reason_code)} {probe.error_text or ''}",
+                    file=sys.stderr,
+                )
+            return PcfQmgrProbeResult(
+                responses, get_result.comp_code, get_result.reason_code, get_result.error_text,
+                reply_queue_name=reply_queue.name,
+            )
         for response in responses:
             if getattr(response, "comp_code", 0) == 2:
                 return PcfQmgrProbeResult(responses, response.comp_code, response.reason_code, "PCF Inquire Queue Manager failed")
         return PcfQmgrProbeResult(responses, get_result.comp_code, get_result.reason_code)
     finally:
+        session_sock.settimeout(_orig_timeout)
         if command_handle is not None:
             try:
                 close_object(session_sock, command_handle, swap, ccsid)
@@ -1131,7 +1710,6 @@ def browse_message(
             ccsid=mqlogin.read_u32_ordered(reply, base + 28, swap),
             format_name=mqlogin.decode_mq_field(reply[base + 32 : base + 40], ccsid),
             message_id=reply[base + 48 : base + 72],
-            correlation_id=reply[base + 72 : base + 96],
         )
     except Exception as exc:
         return BrowseResult(2, 2195, error_text=str(exc))
@@ -1152,36 +1730,6 @@ def browse_queue(
             close_object(session_sock, handle, swap, ccsid)
         except (OSError, ValueError):
             pass
-
-
-def debug_browse_unmatched_pcf_reply(
-    session_sock: object, reply_queue_name: str, swap: bool, ccsid: int, fap_level: int
-) -> None:
-    """Browse one reply-queue message after a correlated PCF GET timed out.
-
-    This is diagnostic-only and uses MQGMO_BROWSE_FIRST, so it does not remove
-    a reply. It can distinguish an empty reply queue from a reply whose
-    CorrelId differs from the request CorrelId.
-    """
-    result = browse_queue(session_sock, reply_queue_name, 1024, swap, ccsid, fap_level)
-    if result.error_text:
-        print(f"[debug] PCF unmatched-reply browse failed: {result.error_text}", file=sys.stderr)
-    elif result.reason_code == 2033:
-        print("[debug] PCF unmatched-reply browse: queue empty", file=sys.stderr)
-    elif result.comp_code == 2:
-        print(
-            f"[debug] PCF unmatched-reply browse failed: mqcc={result.comp_code} mqrc={result.reason_code}",
-            file=sys.stderr,
-        )
-    else:
-        print(
-            "[debug] PCF unmatched-reply browse: "
-            f"mqcc={result.comp_code} mqrc={result.reason_code} data_length={result.data_length} "
-            f"ccsid={result.ccsid} format={result.format_name!r} "
-            f"msg_id={result.message_id.hex() if result.message_id else 'n/a'} "
-            f"correl_id={result.correlation_id.hex() if result.correlation_id else 'n/a'}",
-            file=sys.stderr,
-        )
 
 
 def browse_queue_messages(
@@ -1391,6 +1939,8 @@ def establish_session(args: argparse.Namespace, password: str) -> SessionContext
 
             if id_reply[10] & 0x02:
                 body = id_reply[mqlogin.TSH_HEADER_SIZE :]
+                if len(body) < 134:
+                    raise RuntimeError("short initial-negotiation retry reply")
                 next_ccsid = remote_ccsid
                 next_flags2 = id_flags2 & ~body[45]
                 next_flags3 = id_flags3 & ~body[133]
@@ -1474,9 +2024,9 @@ def establish_session(args: argparse.Namespace, password: str) -> SessionContext
             swap=swap,
             ccsid=active_ccsid,
         )
-    except Exception:
+    except Exception as exc:
         sock.close()
-        raise
+        raise SessionError(stage, str(exc)) from exc
 
 
 def query_spi_functions(args: argparse.Namespace, password: str) -> QueryResult:
@@ -1496,7 +2046,7 @@ def query_spi_functions(args: argparse.Namespace, password: str) -> QueryResult:
         mqlogin.debug_tsh(args, "tx", "spi-query-send", packet)
         session.sock.sendall(packet)
 
-        reply = mqlogin.recv_tsh_packet(session.sock)
+        reply = _recv_spanned_mqi_reply(session.sock)
         mqlogin.debug_tsh(args, "rx", "spi-query-recv", reply)
         if len(reply) < mqlogin.TSH_HEADER_SIZE:
             result.error_text = "short SPI reply"
@@ -1514,7 +2064,7 @@ def query_spi_functions(args: argparse.Namespace, password: str) -> QueryResult:
         result.verbs = verbs
         return result
     except Exception as exc:
-        return QueryResult(error_text=str(exc))
+        return QueryResult(error_text=str(exc), stage=getattr(exc, "stage", None))
     finally:
         if session is not None:
             session.sock.close()
@@ -1535,6 +2085,15 @@ def print_result(args: argparse.Namespace, result: QueryResult) -> int:
         if result.stage:
             print(f"    stage: {result.stage}")
         print(f"    error: {result.error_text}")
+        print()
+        return 1
+
+    if result.comp_code == 2:
+        print("    login/query: failed")
+        if result.stage:
+            print(f"    stage: {result.stage}")
+        print(f"    spi mqcc: {mqlogin.format_mqcc(result.comp_code)}")
+        print(f"    spi mqrc: {mqlogin.format_mqrc(result.reason_code or 0)}")
         print()
         return 1
 
