@@ -30,6 +30,10 @@ MQCSP_VERSION_1 = 1
 MQCSP_AUTH_USER_ID_AND_PWD = 1
 RFP_FAP_LEVEL = 17
 LOCAL_CCSID = 819
+# RfpID.MaxMessageSize (offset 16): advertising 0 causes the queue manager to
+# negotiate a zero-length session limit, so every non-empty MQPUT is rejected
+# with MQRC_MSG_TOO_BIG_FOR_CHANNEL (2218). 4 MB matches the IBM MQ client default.
+MQCD_DEFAULT_MAX_MSG_LENGTH = 4194304
 RFP_TST_INITIAL_INFO = 1
 RFP_TST_STATUS_INFO = 5
 RFP_TST_USERID_DATA = 8
@@ -92,20 +96,9 @@ PASSWORD_PROTECTION_ALGORITHMS = {
     1: "DES-based protected password (legacy protection; TLS is still required for transport security)",
 }
 
-MQRC_NAMES = {
-    0: "MQRC_NONE",
-    2009: "MQRC_CONNECTION_BROKEN",
-    2035: "MQRC_NOT_AUTHORIZED",
-    2059: "MQRC_Q_MGR_NOT_AVAILABLE",
-    2063: "MQRC_SECURITY_ERROR",
-    2195: "MQRC_UNEXPECTED_ERROR",
-    2278: "MQRC_CLIENT_CONN_ERROR",
-    2291: "MQRC_USER_ID_NOT_AVAILABLE",
-    2393: "MQRC_SSL_INITIALIZATION_ERROR",
-    2537: "MQRC_CHANNEL_NOT_AVAILABLE",
-    2538: "MQRC_HOST_NOT_AVAILABLE",
-    2594: "MQRC_PASSWORD_PROTECTION_ERROR",
-}
+# Full IBM MQ completion/reason-code tables (regenerated from the IBM MQ CMQC
+# header); mqlogin's own format_mqrc/format_mqcc below use these directly.
+from mqrc_codes import MQCC_NAMES, MQRC_NAMES, MQRCCF_NAMES, PCF_SELECTOR_NAMES
 
 
 class BannerArgumentParser(argparse.ArgumentParser):
@@ -131,6 +124,22 @@ class RawLoginResult:
 def format_mqrc(reason_code: int) -> str:
     name = MQRC_NAMES.get(reason_code)
     return f"{reason_code} ({name})" if name else str(reason_code)
+
+
+def format_mqcc(comp_code: int) -> str:
+    name = MQCC_NAMES.get(comp_code)
+    return f"{comp_code} ({name})" if name else str(comp_code)
+
+
+def format_pcf_reason(reason_code: int) -> str:
+    """Format a PCF response reason, which may be an MQRC_* or an MQRCCF_*."""
+    name = MQRC_NAMES.get(reason_code) or MQRCCF_NAMES.get(reason_code)
+    return f"{reason_code} ({name})" if name else str(reason_code)
+
+
+def format_pcf_selector(selector: int) -> str:
+    name = PCF_SELECTOR_NAMES.get(selector)
+    return f"{selector} ({name})" if name else str(selector)
 
 
 def format_password_protection(algorithm: int) -> str:
@@ -633,7 +642,10 @@ def build_initial_id_packet(
     ccsid: int = LOCAL_CCSID,
     id_flags2: int = 0x51,
     id_flags3: int = 0x28,
+    max_message_size: int = MQCD_DEFAULT_MAX_MSG_LENGTH,
 ) -> bytes:
+    if not 1 <= max_message_size <= 0x7FFFFFFF:
+        raise ValueError("maximum message size must be between 1 and 2147483647")
     payload = bytearray(240)
     # RfpID uses a literal ASCII eyecatcher, unlike the MQ character fields.
     payload[0:4] = b"ID  "
@@ -643,7 +655,10 @@ def build_initial_id_packet(
     payload[7] = 0
     payload[10:12] = (10).to_bytes(2, "big")
     write_u32(payload, 12, 0x400)
-    write_u32(payload, 16, 0)
+    # MaxMessageSize (RfpID offset 16). Advertising 0 here makes the queue
+    # manager negotiate a zero-length session limit, so every non-empty
+    # MQPUT is rejected with MQRC_MSG_TOO_BIG_FOR_CHANNEL (2218).
+    write_u32(payload, 16, max_message_size)
     write_u32(payload, 20, 0)
     payload[24:44] = encode_mq_field(channel, 20, ccsid)
     payload[44] = id_flags2
@@ -791,7 +806,7 @@ def build_caut_packet(user: str, password: str, fap_level: int, ppa: int, r_stat
     protected_password_len = remote_ppa_finish_auth_flow(payload, 20, password_offset, r_state, ppa, swap)
     if protected_password_len < 0:
         raise ValueError(f"unsupported MQ password protection algorithm: {ppa}")
-    # RfpCAUT keeps PasswordLen as the original password byte count. The 
+    # RfpCAUT keeps PasswordLen as the original password byte count. The Java
     # client uses the padded protected length only when calculating TSH length.
     # `payload` grows when RemotePPA writes the DES-padded bytes.
     tsh = build_tsh(RFP_TST_CONAUTH_INFO, len(payload), RFP_TCF_FIRST | RFP_TCF_LAST, ccsid)
@@ -913,13 +928,14 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
         active_ccsid = LOCAL_CCSID
         id_flags2 = 0x51
         id_flags3 = 0x28
+        max_message_size = MQCD_DEFAULT_MAX_MSG_LENGTH
         # RemoteConnection retains this R value while it retries ID
         # negotiation. It is one half of the later DES password key state.
         client_r = os.urandom(12)
         for id_attempt in range(4):
             stage = "id-send"
             id_packet = build_initial_id_packet(
-                args.channel, args.qmgr, client_r, active_ccsid, id_flags2, id_flags3
+                args.channel, args.qmgr, client_r, active_ccsid, id_flags2, id_flags3, max_message_size
             )
             debug_tsh(args, "tx", stage, id_packet)
             sock.sendall(id_packet)
@@ -946,13 +962,34 @@ def connect_with_raw(args: argparse.Namespace, password: str) -> RawLoginResult:
                 )
             if id_reply[10] & 0x02:
                 body = id_reply[TSH_HEADER_SIZE:]
+                if len(body) < 134:
+                    return RawLoginResult(
+                        ok=False,
+                        stage=stage,
+                        error_text="short initial-negotiation retry reply",
+                    )
                 next_ccsid = remote_ccsid
                 next_flags2 = id_flags2 & ~body[45]
                 next_flags3 = id_flags3 & ~body[133]
-                if (next_ccsid, next_flags2, next_flags3) != (active_ccsid, id_flags2, id_flags3):
+                next_max_message_size = max_message_size
+                if body[7] & 0x10:
+                    next_max_message_size = read_u32_ordered(body, 16, swap)
+                    if next_max_message_size <= 0:
+                        return RawLoginResult(
+                            ok=False,
+                            stage=stage,
+                            error_text="queue manager negotiated an invalid maximum message size",
+                        )
+                if (next_ccsid, next_flags2, next_flags3, next_max_message_size) != (
+                    active_ccsid,
+                    id_flags2,
+                    id_flags3,
+                    max_message_size,
+                ):
                     active_ccsid = next_ccsid
                     id_flags2 = next_flags2
                     id_flags3 = next_flags3
+                    max_message_size = next_max_message_size
                     continue
                 return RawLoginResult(
                     ok=False,
