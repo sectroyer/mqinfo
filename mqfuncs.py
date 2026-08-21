@@ -58,6 +58,10 @@ PCF_REQUEST_EXPIRY = 300
 # from the dead-letter queue instead of the reply queue. See
 # recover_pcf_replies_via_dlq for when that applies.
 PCF_DLQ_RECOVERY_EXPIRY = 3000
+# A PCF inquiry answers with one reply message per matching object, so this only
+# bounds a runaway receive loop; large queue managers hold many thousands of
+# queues and every one of them is a separate reply.
+DEFAULT_PCF_MAX_MESSAGES = 65536
 QMGR_EVENT_QUEUE = "SYSTEM.ADMIN.QMGR.EVENT"
 MQCMD_ESCAPE = 38
 MQIACF_ESCAPE_TYPE = 1017
@@ -160,6 +164,8 @@ class PcfQueueListResult:
     reason_code: int
     error_text: str | None = None
     reply_queue_name: str | None = None
+    # Set when records were returned but the listing is known to be incomplete.
+    note: str | None = None
 
 
 @dataclass
@@ -1265,13 +1271,19 @@ def get_pcf_responses(
     ccsid: int,
     wait_interval_ms: int = 30000,
     debug: bool = False,
+    max_messages: int = DEFAULT_PCF_MAX_MESSAGES,
 ) -> tuple[list[object], MqiInquireResult]:
-    """Receive correlated PCF replies until the PCF response marks LAST."""
+    """Receive correlated PCF replies until the PCF response marks LAST.
+
+    ``max_messages`` only bounds a runaway loop. One MQCMD_INQUIRE_Q reply
+    arrives per matching object, so a queue manager with tens of thousands of
+    queues legitimately needs a high bound.
+    """
     import mqpcf
 
     responses: list[object] = []
     try:
-        for _ in range(1024):
+        for _ in range(max(1, max_messages)):
             if debug:
                 print(
                     f"[debug] PCF MQGET: hobj={reply_handle} match_correl_id={request_correlation_id.hex()} "
@@ -1317,7 +1329,17 @@ def get_pcf_responses(
             responses.append(parsed)
             if parsed.is_last:
                 return responses, result
-        return responses, MqiInquireResult(2, 2195, error_text="too many PCF response messages")
+        # The bound was reached before any response carried LAST. The replies
+        # collected so far are still valid, so report a warning and hand them
+        # back rather than discarding the whole harvest.
+        return responses, MqiInquireResult(
+            1,
+            0,
+            error_text=(
+                f"stopped after {len(responses)} PCF response messages without a LAST flag "
+                f"(bound is {max(1, max_messages)}); the listing is incomplete"
+            ),
+        )
     except Exception as exc:
         return responses, MqiInquireResult(2, 2195, error_text=str(exc))
 
@@ -1349,6 +1371,7 @@ def list_queues(
     reply_wait_seconds: float = 15.0,
     selector_count: int = len(PCF_QUEUE_LIST_SELECTORS),
     debug: bool = False,
+    max_messages: int = DEFAULT_PCF_MAX_MESSAGES,
 ) -> PcfQueueListResult:
     """Run the authorized, read-only PCF Inquire Queue flow on one session."""
     import mqpcf
@@ -1426,6 +1449,7 @@ def list_queues(
             ccsid,
             reply_wait_ms,
             debug,
+            max_messages,
         )
         if get_result.comp_code == 2:
             detail = get_result.error_text or mqlogin.format_mqrc(get_result.reason_code)
@@ -1452,6 +1476,19 @@ def list_queues(
             records = pcf_queue_records(recovered)
             if records:
                 return PcfQueueListResult(records, 0, 0, reply_queue_name=reply_queue.name)
+            # The MQGET that failed may have been preceded by good replies, e.g.
+            # the reply stream ran dry before any response carried LAST. Those
+            # records are real and worth reporting as a partial listing.
+            partial = pcf_queue_records(responses)
+            if partial:
+                return PcfQueueListResult(
+                    partial, 1, get_result.reason_code,
+                    reply_queue_name=reply_queue.name,
+                    note=(
+                        f"reply stream ended after {len(responses)} responses without a LAST "
+                        f"flag ({detail}); the listing may be incomplete"
+                    ),
+                )
             return PcfQueueListResult(
                 [], get_result.comp_code, get_result.reason_code,
                 f"correlated PCF MQGET failed: {detail}",
@@ -1460,7 +1497,12 @@ def list_queues(
         for response in responses:
             if getattr(response, "comp_code", 0) == 2:
                 return PcfQueueListResult([], response.comp_code, response.reason_code, "PCF Inquire Queue failed")
-        return PcfQueueListResult(pcf_queue_records(responses), get_result.comp_code, get_result.reason_code)
+        return PcfQueueListResult(
+            pcf_queue_records(responses),
+            get_result.comp_code,
+            get_result.reason_code,
+            note=get_result.error_text,
+        )
     finally:
         session_sock.settimeout(_orig_timeout)
         if command_handle is not None:
