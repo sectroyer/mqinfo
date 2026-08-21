@@ -10,6 +10,12 @@ import struct
 
 MQCFT_COMMAND = 1
 MQCFT_RESPONSE = 2
+# z/OS answers an MQCFT_COMMAND_XR (16) request with extended response types
+# rather than the distributed MQCFT_RESPONSE.
+MQCFT_XR_MSG = 17
+MQCFT_XR_ITEM = 18
+MQCFT_XR_SUMMARY = 19
+MQCFT_RESPONSE_TYPES = (MQCFT_RESPONSE, MQCFT_XR_MSG, MQCFT_XR_ITEM, MQCFT_XR_SUMMARY)
 MQCFT_INTEGER = 3
 MQCFT_STRING = 4
 MQCFT_INTEGER_LIST = 5
@@ -84,6 +90,18 @@ def build_inquire_qmgr_request(attributes: list[int], header_type: int = MQCFT_C
     return header + attributes_parameter
 
 
+def build_bare_command_request(command: int, header_type: int = MQCFT_COMMAND) -> bytes:
+    """Build a PCF request carrying only an MQCFH with no parameters.
+
+    Used to probe whether a command code is supported and authorized. A
+    parameter-related error in the reply means authorization was passed and
+    the command server moved on to validating parameters.
+    """
+    if header_type not in (MQCFT_COMMAND, 16):
+        raise ValueError("unsupported PCF command header type")
+    return struct.pack(">IIIIIIIII", header_type, MQCFH_SIZE, 3, command, 1, MQCFC_LAST, 0, 0, 0)
+
+
 def _decode_string(value: bytes, ccsid: int) -> str:
     # PCF object names are normally ASCII-compatible.  Preserve undecodable
     # bytes rather than rejecting a response with an unfamiliar CCSID.
@@ -98,8 +116,8 @@ def parse_response(packet: bytes) -> PcfResponse:
     ptype, length, version, command, sequence, control, comp, reason, count = struct.unpack(
         ">IIIIIIIII", packet[:MQCFH_SIZE]
     )
-    if ptype != MQCFT_RESPONSE or length != MQCFH_SIZE or version not in (1, 2, 3):
-        raise ValueError("invalid MQCFH response")
+    if ptype not in MQCFT_RESPONSE_TYPES or length != MQCFH_SIZE or version not in (1, 2, 3):
+        raise ValueError(f"invalid MQCFH response (type={ptype} length={length} version={version})")
     if control not in (MQCFC_NOT_LAST, MQCFC_LAST):
         raise ValueError("unsupported MQCFH control value")
     offset = MQCFH_SIZE
@@ -131,11 +149,11 @@ def parse_response(packet: bytes) -> PcfResponse:
                 _signed(struct.unpack(">I", packet[offset + 16 + item * 4 : offset + 20 + item * 4])[0])
                 for item in range(item_count)
             ]
-        else:
-            raise ValueError(f"unsupported PCF parameter type {parameter_type}")
         offset += parameter_length
-    if offset != len(packet):
-        raise ValueError("unexpected trailing PCF response bytes")
+    # Trailing bytes are tolerated: messages recovered from a dead-letter queue
+    # can carry padding, and ParameterCount already governs how much is read.
+    if offset > len(packet):
+        raise ValueError("truncated PCF response")
     return PcfResponse(command, sequence, control == MQCFC_LAST, _signed(comp), _signed(reason), parameters)
 
 
