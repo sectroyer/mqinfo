@@ -11,7 +11,7 @@ from pathlib import Path
 import mqlogin
 
 
-SCRIPT_VERSION = "0.1.1"
+SCRIPT_VERSION = "0.1.3"
 BANNER_TITLE = "IBM MQ Channel Check Tool"
 BANNER_CREDIT = "by Michał Majchrowicz AFINE Team"
 BANNER_LINE = f"{BANNER_TITLE} v{SCRIPT_VERSION} {BANNER_CREDIT}"
@@ -159,7 +159,7 @@ def main() -> int:
     except ValueError as exc:
         parser.error(str(exc))
 
-    print(f"{BANNER_LINE}\n")
+    print(f"\n{BANNER_LINE}\n")
     print(f"[+] Checking {len(channels)} channel name(s) on {args.host}:{args.port}")
     results = [check_channel(args, channel) for channel in channels]
     for result in results:
@@ -169,6 +169,7 @@ def main() -> int:
     absent = sum(result.status == "absent" for result in results)
     unconfirmed = len(results) - existing - absent
     print(f"\n[+] Summary: {existing} exists, {absent} absent, {unconfirmed} not confirmed")
+    print()
     return 1 if unconfirmed else 0
 
 
