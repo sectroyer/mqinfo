@@ -6,7 +6,7 @@ import codecs
 import sys
 from collections import defaultdict
 
-SCRIPT_VERSION = "0.1.0"
+SCRIPT_VERSION = "0.1.3"
 BANNER_TITLE = "IBM MQ Password Recovery Tool"
 BANNER_CREDIT = "by Michał Majchrowicz AFINE Team"
 BANNER_LINE = f"{BANNER_TITLE} v{SCRIPT_VERSION} {BANNER_CREDIT}"
@@ -494,7 +494,7 @@ def main() -> int:
             total += 1
         print()
 
-    print(f"[+] Recovered {total} credential pair(s) from {len(streams)} stream(s)")
+    print(f"[+] Recovered {total} credential pair(s) from {len(streams)} stream(s)\n")
     return 0 if total > 0 else 1
 
 
