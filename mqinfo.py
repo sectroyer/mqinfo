@@ -13,10 +13,17 @@ DEFAULT_PORTS = [1414, 1415, 1416, 1417, 1418, 1419]
 CONNECT_TIMEOUT = 3.0
 READ_TIMEOUT = 2.0
 MAX_READ = 4096
-SCRIPT_VERSION = "0.2.10"
+SCRIPT_VERSION = "0.2.11"
 BANNER_TITLE = "IBM MQ Info Tool"
 BANNER_CREDIT = "by Michał Majchrowicz AFINE Team"
 BANNER_LINE = f"{BANNER_TITLE} v{SCRIPT_VERSION} {BANNER_CREDIT}"
+ANSI_RESET = "\033[0m"
+STATUS_COLORS = {
+    "open": "\033[32m",
+    "closed": "\033[31m",
+    "timeout": "\033[33m",
+    "error": "\033[35m",
+}
 TSH_HEADER_SIZE = 28
 IBM_MQ_PROBE = (
     b"TSH\x20\x00\x00\x00\xEC\x01\x01\x31\x00\x00\x00\x00\x00\x00\x00\x00"
@@ -157,6 +164,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--flags",
         action="store_true",
         help="Show raw MQ ID/IDE/error flag fields from the listener response",
+    )
+    parser.add_argument(
+        "--color",
+        "-c",
+        action="store_true",
+        help="Color key status lines to improve readability",
     )
     return parser
 
@@ -575,8 +588,15 @@ def print_parsed_metadata(metadata: Dict[str, str], debug: bool, show_flags: boo
         print(f"      - r_hex: {metadata['r_hex']}")
 
 
+def colorize(text: str, color_name: str, enabled: bool) -> str:
+    if not enabled:
+        return text
+    color_code = STATUS_COLORS.get(color_name)
+    return f"{color_code}{text}{ANSI_RESET}" if color_code else text
+
+
 def probe_port(
-    host: str, port: int, debug: bool, socks_proxy: str | None, show_flags: bool
+    host: str, port: int, debug: bool, socks_proxy: str | None, show_flags: bool, color: bool
 ) -> int:
     print(f"[+] Probing {host}:{port}")
     try:
@@ -591,16 +611,16 @@ def probe_port(
                 data = recv_all(sock)
                 response_mode = "IBM MQ probe response"
     except ConnectionRefusedError:
-        print("    closed")
+        print(f"    {colorize('closed', 'closed', color)}")
         return 1
     except TimeoutError:
-        print("    timeout")
+        print(f"    {colorize('timeout', 'timeout', color)}")
         return 1
     except OSError as exc:
-        print(f"    error: {exc}")
+        print(f"    {colorize('error', 'error', color)}: {exc}")
         return 1
 
-    print("    open")
+    print(f"    {colorize('open', 'open', color)}")
     if not data:
         if debug:
             print("    no passive banner and no reply to IBM MQ probe")
@@ -658,7 +678,7 @@ def main() -> int:
             print(f"invalid port: {port}", file=sys.stderr)
             return 2
         try:
-            rc |= probe_port(args.host, port, args.debug, args.socks, args.flags)
+            rc |= probe_port(args.host, port, args.debug, args.socks, args.flags, args.color)
         except ValueError as exc:
             print(f"invalid SOCKS proxy: {exc}", file=sys.stderr)
             return 2
